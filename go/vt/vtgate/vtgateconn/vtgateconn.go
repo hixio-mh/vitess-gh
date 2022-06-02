@@ -17,10 +17,10 @@ limitations under the License.
 package vtgateconn
 
 import (
+	"context"
 	"flag"
 	"fmt"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/log"
 
@@ -54,6 +54,19 @@ func (conn *VTGateConn) Session(targetString string, options *querypb.ExecuteOpt
 	}
 }
 
+// SessionPb returns the underlying proto session.
+func (sn *VTGateSession) SessionPb() *vtgatepb.Session {
+	return sn.session
+}
+
+// SessionFromPb returns a VTGateSession based on the provided proto session.
+func (conn *VTGateConn) SessionFromPb(sn *vtgatepb.Session) *VTGateSession {
+	return &VTGateSession{
+		session: sn,
+		impl:    conn.impl,
+	}
+}
+
 // ResolveTransaction resolves the 2pc transaction.
 func (conn *VTGateConn) ResolveTransaction(ctx context.Context, dtid string) error {
 	return conn.impl.ResolveTransaction(ctx, dtid)
@@ -73,8 +86,9 @@ type VStreamReader interface {
 }
 
 // VStream streams binlog events.
-func (conn *VTGateConn) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter) (VStreamReader, error) {
-	return conn.impl.VStream(ctx, tabletType, vgtid, filter)
+func (conn *VTGateConn) VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid,
+	filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags) (VStreamReader, error) {
+	return conn.impl.VStream(ctx, tabletType, vgtid, filter, flags)
 }
 
 // VTGateSession exposes the V3 API to the clients.
@@ -113,6 +127,13 @@ func (sn *VTGateSession) StreamExecute(ctx context.Context, query string, bindVa
 	return sn.impl.StreamExecute(ctx, sn.session, query, bindVars)
 }
 
+// Prepare performs a VTGate Prepare.
+func (sn *VTGateSession) Prepare(ctx context.Context, query string, bindVars map[string]*querypb.BindVariable) ([]*querypb.Field, error) {
+	session, fields, err := sn.impl.Prepare(ctx, sn.session, query, bindVars)
+	sn.session = session
+	return fields, err
+}
+
 //
 // The rest of this file is for the protocol implementations.
 //
@@ -129,11 +150,17 @@ type Impl interface {
 	// StreamExecute executes a streaming query on vtgate. This is a V3 function.
 	StreamExecute(ctx context.Context, session *vtgatepb.Session, query string, bindVars map[string]*querypb.BindVariable) (sqltypes.ResultStream, error)
 
+	// Prepare returns the fields information for the query as part of supporting prepare statements.
+	Prepare(ctx context.Context, session *vtgatepb.Session, sql string, bindVariables map[string]*querypb.BindVariable) (*vtgatepb.Session, []*querypb.Field, error)
+
+	// CloseSession closes the session provided by rolling back any active transaction.
+	CloseSession(ctx context.Context, session *vtgatepb.Session) error
+
 	// ResolveTransaction resolves the specified 2pc transaction.
 	ResolveTransaction(ctx context.Context, dtid string) error
 
 	// VStream streams binlogevents
-	VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter) (VStreamReader, error)
+	VStream(ctx context.Context, tabletType topodatapb.TabletType, vgtid *binlogdatapb.VGtid, filter *binlogdatapb.Filter, flags *vtgatepb.VStreamFlags) (VStreamReader, error)
 
 	// Close must be called for releasing resources.
 	Close()

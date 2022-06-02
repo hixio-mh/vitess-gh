@@ -42,22 +42,26 @@ func TestEnsureDB(t *testing.T) {
 	err = clusterInstance.StartVttablet(tablet, "NOT_SERVING", false, cell, "dbtest", hostname, "0")
 	require.NoError(t, err)
 
-	// Make it the master.
+	// Make it the primary.
 	err = clusterInstance.VtctlclientProcess.ExecuteCommand("TabletExternallyReparented", tablet.Alias)
 	require.NoError(t, err)
 
-	// It goes SERVING because TER calls ChangeTabletType which will also set the database to read-write
-	assert.Equal(t, "SERVING", tablet.VttabletProcess.GetTabletStatus())
+	// It is still NOT_SERVING because the db is read-only.
+	assert.Equal(t, "NOT_SERVING", tablet.VttabletProcess.GetTabletStatus())
 	status := tablet.VttabletProcess.GetStatusDetails()
-	assert.Contains(t, status, "Serving")
+	assert.Contains(t, status, "read-only")
 
+	// Switch to read-write and verify that that we go serving.
+	_ = clusterInstance.VtctlclientProcess.ExecuteCommand("SetReadWrite", tablet.Alias)
+	err = tablet.VttabletProcess.WaitForTabletStatus("SERVING")
+	require.NoError(t, err)
 	killTablets(t, tablet)
 }
 
 // TestLocalMetadata tests the contents of local_metadata table after vttablet startup
 func TestLocalMetadata(t *testing.T) {
 	defer cluster.PanicHandler(t)
-	// by default tablets are started with -restore_from_backup
+	// by default tablets are started with --restore_from_backup
 	// so metadata should exist
 	cluster.VerifyLocalMetadata(t, &replicaTablet, keyspaceName, shardName, cell)
 
@@ -65,8 +69,8 @@ func TestLocalMetadata(t *testing.T) {
 	rTablet := clusterInstance.NewVttabletInstance("replica", 0, "")
 
 	clusterInstance.VtTabletExtraArgs = []string{
-		"-lock_tables_timeout", "5s",
-		"-init_populate_metadata",
+		"--lock_tables_timeout", "5s",
+		"--init_populate_metadata",
 	}
 	rTablet.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(rTablet.TabletUID, rTablet.MySQLPort, clusterInstance.TmpDirectory)
 	err := rTablet.MysqlctlProcess.Start()
@@ -75,6 +79,7 @@ func TestLocalMetadata(t *testing.T) {
 	log.Info(fmt.Sprintf("Started vttablet %v", rTablet))
 	// SupportsBackup=False prevents vttablet from trying to restore
 	// Start vttablet process
+	clusterInstance.VtGatePlannerVersion = 0
 	err = clusterInstance.StartVttablet(rTablet, "SERVING", false, cell, keyspaceName, hostname, shardName)
 	require.NoError(t, err)
 
@@ -83,9 +88,9 @@ func TestLocalMetadata(t *testing.T) {
 	// Create another new tablet
 	rTablet2 := clusterInstance.NewVttabletInstance("replica", 0, "")
 
-	// start with -init_populate_metadata false (default)
+	// start with --init_populate_metadata false (default)
 	clusterInstance.VtTabletExtraArgs = []string{
-		"-lock_tables_timeout", "5s",
+		"--lock_tables_timeout", "5s",
 	}
 	rTablet2.MysqlctlProcess = *cluster.MysqlCtlProcessInstance(rTablet2.TabletUID, rTablet2.MySQLPort, clusterInstance.TmpDirectory)
 	err = rTablet2.MysqlctlProcess.Start()

@@ -37,12 +37,20 @@
   "FullQuery": "show tables"
 }
 
+# show table status
+"show table status"
+{
+  "PlanID": "SelectStream",
+  "TableName": "",
+  "FullQuery": "show table status"
+}
+
 # other
 "desc foo"
 {
   "PlanID": "SelectStream",
   "TableName": "",
-  "FullQuery": "otherread"
+  "FullQuery": "explain foo"
 }
 
 # dml

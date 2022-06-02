@@ -48,13 +48,6 @@ create table vstream_test(
 	primary key(id)
 ) Engine=InnoDB;
 
-create table aggr_test(
-	id bigint,
-	val1 varchar(16),
-	val2 bigint,
-	primary key(id)
-) Engine=InnoDB;
-
 create table t2(
 	id3 bigint,
 	id4 bigint,
@@ -87,14 +80,14 @@ create table t4(
 	id1 bigint,
 	id2 varchar(10),
 	primary key(id1)
-) Engine=InnoDB;
+) ENGINE=InnoDB DEFAULT charset=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 create table t4_id2_idx(
 	id2 varchar(10),
 	id1 bigint,
 	keyspace_id varbinary(50),
     primary key(id2, id1)
-) Engine=InnoDB;
+) Engine=InnoDB DEFAULT charset=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 create table t5_null_vindex(
 	id bigint not null,
@@ -127,17 +120,45 @@ create table t7_xxhash_idx(
 	phone bigint,
 	keyspace_id varbinary(50),
 	primary key(phone, keyspace_id)
-) Engine=InnoDB;`
+) Engine=InnoDB;
+
+create table t7_fk(
+	id bigint,
+	t7_uid varchar(50),
+    primary key(id),
+    CONSTRAINT t7_fk_ibfk_1 foreign key (t7_uid) references t7_xxhash(uid)
+    on delete set null on update cascade
+) Engine=InnoDB;
+
+create table t8(
+	id bigint,
+	t9_id bigint DEFAULT NULL,
+  parent_id bigint,
+  primary key(id)
+) Engine=InnoDB;
+
+create table t9(
+	id bigint,
+  parent_id bigint,
+  primary key(id)
+) Engine=InnoDB;
+
+create table t9_id_to_keyspace_id_idx(
+	id bigint,
+	keyspace_id varbinary(10),
+	primary key(id)
+) Engine=InnoDB;
+`
 
 	VSchema = `
 {
   "sharded": true,
   "vindexes": {
     "unicode_loose_xxhash" : {
-	  "type": "unicode_loose_xxhash"
+      "type": "unicode_loose_xxhash"
     },
     "unicode_loose_md5" : {
-	  "type": "unicode_loose_md5"
+      "type": "unicode_loose_md5"
     },
     "hash": {
       "type": "hash"
@@ -201,6 +222,15 @@ create table t7_xxhash_idx(
         "ignore_nulls": "true"
       },
       "owner": "t7_xxhash"
+    },
+    "t9_id_to_keyspace_id_idx": {
+      "type": "lookup_unique",
+      "params": {
+        "table": "t9_id_to_keyspace_id_idx",
+        "from": "id",
+        "to": "keyspace_id"
+      },
+      "owner": "t9"
     }
   },
   "tables": {
@@ -264,7 +294,7 @@ create table t7_xxhash_idx(
         }
       ]
     },
-	"t4": {
+    "t4": {
       "column_vindexes": [
         {
           "column": "id1",
@@ -284,7 +314,7 @@ create table t7_xxhash_idx(
         }
       ]
     },
-	"t6": {
+    "t6": {
       "column_vindexes": [
         {
           "column": "id1",
@@ -304,7 +334,7 @@ create table t7_xxhash_idx(
         }
       ]
     },
-	"t5_null_vindex": {
+    "t5_null_vindex": {
       "column_vindexes": [
         {
           "column": "idx",
@@ -334,7 +364,7 @@ create table t7_xxhash_idx(
         }
       ]
     },
-	"t7_xxhash": {
+    "t7_xxhash": {
       "column_vindexes": [
         {
           "column": "uid",
@@ -353,9 +383,58 @@ create table t7_xxhash_idx(
           "name": "unicode_loose_xxhash"
         }
       ]
+    },
+    "t7_fk": {
+      "column_vindexes": [
+        {
+          "column": "t7_uid",
+          "name": "unicode_loose_xxhash"
+        }
+      ]
+    },
+    "t8": {
+      "column_vindexes": [
+        {
+          "column": "parent_id",
+          "name": "hash"
+        },
+        {
+          "column": "t9_id",
+          "name": "t9_id_to_keyspace_id_idx"
+        }
+      ]
+    },
+    "t9": {
+      "column_vindexes": [
+        {
+          "column": "parent_id",
+          "name": "hash"
+        },
+        {
+          "column": "id",
+          "name": "t9_id_to_keyspace_id_idx"
+        }
+      ]
+    },
+    "t9_id_to_keyspace_id_idx": {
+      "column_vindexes": [
+        {
+          "column": "id",
+          "name": "hash"
+        }
+      ]
     }
   }
-}`
+}
+`
+	routingRules = `
+{"rules": [
+  {
+    "from_table": "ks.t1000",
+	"to_tables": ["ks.t1"]
+  }
+]}
+`
 )
 
 func TestMain(m *testing.M) {
@@ -378,16 +457,30 @@ func TestMain(m *testing.M) {
 			SchemaSQL: SchemaSQL,
 			VSchema:   VSchema,
 		}
+		clusterInstance.VtGateExtraArgs = []string{"--schema_change_signal"}
+		clusterInstance.VtTabletExtraArgs = []string{"--queryserver-config-schema-change-signal", "--queryserver-config-schema-change-signal-interval", "0.1"}
 		err = clusterInstance.StartKeyspace(*keyspace, []string{"-80", "80-"}, 1, true)
 		if err != nil {
 			return 1
 		}
 
+		err = clusterInstance.VtctlclientProcess.ApplyRoutingRules(routingRules)
+		if err != nil {
+			return 1
+		}
+
+		err = clusterInstance.VtctlclientProcess.ExecuteCommand("RebuildVSchemaGraph")
+		if err != nil {
+			return 1
+		}
+
+		clusterInstance.VtGateExtraArgs = append(clusterInstance.VtGateExtraArgs, "--enable_system_settings=true")
 		// Start vtgate
 		err = clusterInstance.StartVtgate()
 		if err != nil {
 			return 1
 		}
+
 		vtParams = mysql.ConnParams{
 			Host: clusterInstance.Hostname,
 			Port: clusterInstance.VtgateMySQLPort,

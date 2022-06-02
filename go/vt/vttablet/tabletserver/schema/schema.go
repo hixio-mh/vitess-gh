@@ -52,6 +52,10 @@ type Table struct {
 
 	// MessageInfo contains info for message tables.
 	MessageInfo *MessageInfo
+
+	CreateTime    int64
+	FileSize      uint64
+	AllocatedSize uint64
 }
 
 // SequenceInfo contains info specific to sequence tabels.

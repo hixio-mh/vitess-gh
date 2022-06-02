@@ -17,14 +17,13 @@ limitations under the License.
 package mysql
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 )
 
 type filePosFlavor struct {
@@ -38,14 +37,14 @@ func newFilePosFlavor() flavor {
 	return &filePosFlavor{}
 }
 
-// masterGTIDSet is part of the Flavor interface.
-func (flv *filePosFlavor) masterGTIDSet(c *Conn) (GTIDSet, error) {
+// primaryGTIDSet is part of the Flavor interface.
+func (flv *filePosFlavor) primaryGTIDSet(c *Conn) (GTIDSet, error) {
 	qr, err := c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
 	if err != nil {
 		return nil, err
 	}
 	if len(qr.Rows) == 0 {
-		return nil, errors.New("no master status")
+		return nil, ErrNoPrimaryStatus
 	}
 
 	resultMap, err := resultToMap(qr)
@@ -79,6 +78,14 @@ func (flv *filePosFlavor) stopIOThreadCommand() string {
 	return "unsupported"
 }
 
+func (flv *filePosFlavor) stopSQLThreadCommand() string {
+	return "unsupported"
+}
+
+func (flv *filePosFlavor) startSQLThreadCommand() string {
+	return "unsupported"
+}
+
 // sendBinlogDumpCommand is part of the Flavor interface.
 func (flv *filePosFlavor) sendBinlogDumpCommand(c *Conn, serverID uint32, startPos Position) error {
 	rpos, ok := startPos.GTIDSet.(filePosGTID)
@@ -109,7 +116,11 @@ func (flv *filePosFlavor) readBinlogEvent(c *Conn) (BinlogEvent, error) {
 			return nil, ParseErrorPacket(result)
 		}
 
-		event := &filePosBinlogEvent{binlogEvent: binlogEvent(result[1:])}
+		buf, semiSyncAckRequested, err := c.AnalyzeSemiSyncAckRequest(result[1:])
+		if err != nil {
+			return nil, err
+		}
+		event := newFilePosBinlogEventWithSemiSyncInfo(buf, semiSyncAckRequested)
 		switch event.Type() {
 		case eGTIDEvent, eAnonymousGTIDEvent, ePreviousGTIDsEvent, eMariaGTIDListEvent:
 			// Don't transmit fake or irrelevant events because we should not
@@ -180,7 +191,7 @@ func (flv *filePosFlavor) setReplicationPositionCommands(pos Position) []string 
 }
 
 // setReplicationPositionCommands is part of the Flavor interface.
-func (flv *filePosFlavor) changeMasterArg() string {
+func (flv *filePosFlavor) changeReplicationSourceArg() string {
 	return "unsupported"
 }
 
@@ -213,27 +224,27 @@ func parseFilePosReplicationStatus(resultMap map[string]string) (ReplicationStat
 	return status, nil
 }
 
-// masterStatus is part of the Flavor interface.
-func (flv *filePosFlavor) masterStatus(c *Conn) (MasterStatus, error) {
+// primaryStatus is part of the Flavor interface.
+func (flv *filePosFlavor) primaryStatus(c *Conn) (PrimaryStatus, error) {
 	qr, err := c.ExecuteFetch("SHOW MASTER STATUS", 100, true /* wantfields */)
 	if err != nil {
-		return MasterStatus{}, err
+		return PrimaryStatus{}, err
 	}
 	if len(qr.Rows) == 0 {
 		// The query returned no data. We don't know how this could happen.
-		return MasterStatus{}, ErrNoMasterStatus
+		return PrimaryStatus{}, ErrNoPrimaryStatus
 	}
 
 	resultMap, err := resultToMap(qr)
 	if err != nil {
-		return MasterStatus{}, err
+		return PrimaryStatus{}, err
 	}
 
-	return parseFilePosMasterStatus(resultMap)
+	return parseFilePosPrimaryStatus(resultMap)
 }
 
-func parseFilePosMasterStatus(resultMap map[string]string) (MasterStatus, error) {
-	status := parseMasterStatus(resultMap)
+func parseFilePosPrimaryStatus(resultMap map[string]string) (PrimaryStatus, error) {
+	status := parsePrimaryStatus(resultMap)
 
 	status.Position = status.FilePosition
 
@@ -262,6 +273,10 @@ func (*filePosFlavor) startReplicationUntilAfter(pos Position) string {
 	return "unsupported"
 }
 
+func (*filePosFlavor) startSQLThreadUntilAfter(pos Position) string {
+	return "unsupported"
+}
+
 // enableBinlogPlaybackCommand is part of the Flavor interface.
 func (*filePosFlavor) enableBinlogPlaybackCommand() string {
 	return ""
@@ -270,4 +285,14 @@ func (*filePosFlavor) enableBinlogPlaybackCommand() string {
 // disableBinlogPlaybackCommand is part of the Flavor interface.
 func (*filePosFlavor) disableBinlogPlaybackCommand() string {
 	return ""
+}
+
+// baseShowTablesWithSizes is part of the Flavor interface.
+func (*filePosFlavor) baseShowTablesWithSizes() string {
+	return TablesWithSize56
+}
+
+// supportsFastDropTable is part of the Flavor interface.
+func (*filePosFlavor) supportsFastDropTable(c *Conn) (bool, error) {
+	return false, nil
 }

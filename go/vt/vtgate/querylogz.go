@@ -82,7 +82,7 @@ var (
 
 // querylogzHandler serves a human readable snapshot of the
 // current query log.
-func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Request) {
+func querylogzHandler(ch chan any, w http.ResponseWriter, r *http.Request) {
 	if err := acl.CheckAccessHTTP(r, acl.DEBUGGING); err != nil {
 		acl.SendError(w, err)
 		return
@@ -105,9 +105,9 @@ func querylogzHandler(ch chan interface{}, w http.ResponseWriter, r *http.Reques
 			stats, ok := out.(*LogStats)
 			if !ok {
 				err := fmt.Errorf("unexpected value in %s: %#v (expecting value of type %T)", QueryLogger.Name(), out, &LogStats{})
-				io.WriteString(w, `<tr class="error">`)
-				io.WriteString(w, err.Error())
-				io.WriteString(w, "</tr>")
+				_, _ = io.WriteString(w, `<tr class="error">`)
+				_, _ = io.WriteString(w, err.Error())
+				_, _ = io.WriteString(w, "</tr>")
 				log.Error(err)
 				continue
 			}

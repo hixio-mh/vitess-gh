@@ -18,6 +18,7 @@ package inst
 
 import (
 	"github.com/rcrowley/go-metrics"
+
 	"vitess.io/vitess/go/vt/orchestrator/config"
 	"vitess.io/vitess/go/vt/orchestrator/db"
 	"vitess.io/vitess/go/vt/orchestrator/external/golib/log"
@@ -77,7 +78,7 @@ func WriteResolvedHostname(hostname string, resolvedHostname string) error {
 
 // ReadResolvedHostname returns the resolved hostname given a hostname, or empty if not exists
 func ReadResolvedHostname(hostname string) (string, error) {
-	var resolvedHostname string = ""
+	var resolvedHostname string
 
 	query := `
 		select

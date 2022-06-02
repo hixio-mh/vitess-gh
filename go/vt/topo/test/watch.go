@@ -20,8 +20,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+
+	"context"
 
 	"vitess.io/vitess/go/vt/topo"
 

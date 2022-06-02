@@ -20,7 +20,11 @@
 #       therefore we need to have the symlinked "Dockerfile" in there as well.
 # TODO(mberlin): Remove the symlink and this note once
 # https://github.com/docker/hub-feedback/issues/292 is fixed.
-FROM vitess/bootstrap:mysql57
+
+ARG bootstrap_version=8
+ARG image="vitess/bootstrap:${bootstrap_version}-mysql57"
+
+FROM "${image}"
 
 # Allows some docker builds to disable CGO
 ARG CGO_ENABLED=0
@@ -38,4 +42,3 @@ RUN make build
 # Fix permissions
 RUN chown -R vitess:vitess /vt
 USER vitess
-

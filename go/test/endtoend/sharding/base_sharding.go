@@ -127,20 +127,20 @@ func CheckValues(t *testing.T, vttablet cluster.Vttablet, id uint64, msg string,
 	return isFound
 }
 
-// CheckDestinationMaster performs multiple checks on a destination master.
-func CheckDestinationMaster(t *testing.T, vttablet cluster.Vttablet, sourceShards []string, ci cluster.LocalProcessCluster) {
+// CheckDestinationPrimary performs multiple checks on a destination primary.
+func CheckDestinationPrimary(t *testing.T, vttablet cluster.Vttablet, sourceShards []string, ci cluster.LocalProcessCluster) {
 	_ = vttablet.VttabletProcess.WaitForBinLogPlayerCount(len(sourceShards))
 	CheckBinlogPlayerVars(t, vttablet, sourceShards, 0)
 	checkStreamHealthEqualsBinlogPlayerVars(t, vttablet, len(sourceShards), ci)
 }
 
 // CheckBinlogPlayerVars Checks the binlog player variables are correctly exported.
-func CheckBinlogPlayerVars(t *testing.T, vttablet cluster.Vttablet, sourceShards []string, secondBehindMaster int64) {
+func CheckBinlogPlayerVars(t *testing.T, vttablet cluster.Vttablet, sourceShards []string, replicationLagSeconds int64) {
 	tabletVars := vttablet.VttabletProcess.GetVars()
 
 	assert.Contains(t, tabletVars, "VReplicationStreamCount")
-	assert.Contains(t, tabletVars, "VReplicationSecondsBehindMasterMax")
-	assert.Contains(t, tabletVars, "VReplicationSecondsBehindMaster")
+	assert.Contains(t, tabletVars, "VReplicationLagSecondsMax")
+	assert.Contains(t, tabletVars, "VReplicationLagSeconds")
 	assert.Contains(t, tabletVars, "VReplicationSource")
 	assert.Contains(t, tabletVars, "VReplicationSourceTablet")
 
@@ -162,17 +162,17 @@ func CheckBinlogPlayerVars(t *testing.T, vttablet cluster.Vttablet, sourceShards
 		assert.Containsf(t, replicationSourceValue, shard, "Source shard is not matched with vReplication shard value")
 	}
 
-	if secondBehindMaster != 0 {
-		secondBehindMaserMaxStr := fmt.Sprintf("%v", reflect.ValueOf(tabletVars["VReplicationSecondsBehindMasterMax"]))
-		secondBehindMaserMax, _ := strconv.ParseFloat(secondBehindMaserMaxStr, 64)
+	if replicationLagSeconds != 0 {
+		vreplicationLagMaxStr := fmt.Sprintf("%v", reflect.ValueOf(tabletVars["VReplicationLagSecondsMax"]))
+		vreplicationLagMax, _ := strconv.ParseFloat(vreplicationLagMaxStr, 64)
 
-		assert.True(t, secondBehindMaserMax < float64(secondBehindMaster))
+		assert.True(t, vreplicationLagMax < float64(replicationLagSeconds))
 
-		replicationSecondBehindMasterObj := reflect.ValueOf(tabletVars["VReplicationSecondsBehindMaster"])
+		replicationLagObj := reflect.ValueOf(tabletVars["VReplicationLagSeconds"])
 		for _, key := range replicationSourceObj.MapKeys() {
-			str := fmt.Sprintf("%v", replicationSecondBehindMasterObj.MapIndex(key))
+			str := fmt.Sprintf("%v", replicationLagObj.MapIndex(key))
 			flt, _ := strconv.ParseFloat(str, 64)
-			assert.True(t, flt < float64(secondBehindMaster))
+			assert.True(t, flt < float64(replicationLagSeconds))
 		}
 	}
 }
@@ -183,15 +183,14 @@ func checkStreamHealthEqualsBinlogPlayerVars(t *testing.T, vttablet cluster.Vtta
 
 	streamCountStr := fmt.Sprintf("%v", reflect.ValueOf(tabletVars["VReplicationStreamCount"]))
 	streamCount, _ := strconv.Atoi(streamCountStr)
-
-	secondBehindMaserMaxStr := fmt.Sprintf("%v", reflect.ValueOf(tabletVars["VReplicationSecondsBehindMasterMax"]))
-	secondBehindMaserMax, _ := strconv.ParseFloat(secondBehindMaserMaxStr, 64)
+	vreplicationLagMaxStr := fmt.Sprintf("%v", reflect.ValueOf(tabletVars["VReplicationLagSecondsMax"]))
+	vreplicationLagMax, _ := strconv.ParseFloat(vreplicationLagMaxStr, 64)
 
 	assert.Equal(t, streamCount, count)
 	// Enforce health check because it's not running by default as
 	// tablets may not be started with it, or may not run it in time.
 	_ = ci.VtctlclientProcess.ExecuteCommand("RunHealthCheck", vttablet.Alias)
-	streamHealth, err := ci.VtctlclientProcess.ExecuteCommandWithOutput("VtTabletStreamHealth", "-count", "1", vttablet.Alias)
+	streamHealth, err := ci.VtctlclientProcess.ExecuteCommandWithOutput("VtTabletStreamHealth", "--", "--count", "1", vttablet.Alias)
 	require.Nil(t, err)
 
 	var streamHealthResponse querypb.StreamHealthResponse
@@ -203,7 +202,7 @@ func checkStreamHealthEqualsBinlogPlayerVars(t *testing.T, vttablet cluster.Vtta
 	assert.NotNil(t, streamHealthResponse.RealtimeStats.BinlogPlayersCount)
 
 	assert.Equal(t, streamCount, int(streamHealthResponse.RealtimeStats.BinlogPlayersCount))
-	assert.Equal(t, secondBehindMaserMax, float64(streamHealthResponse.RealtimeStats.SecondsBehindMasterFilteredReplication))
+	assert.Equal(t, vreplicationLagMax, float64(streamHealthResponse.RealtimeStats.FilteredReplicationLagSeconds))
 }
 
 // CheckBinlogServerVars checks the binlog server variables are correctly exported.
@@ -253,7 +252,7 @@ func executeQueryInTransaction(t *testing.T, query string, dbConn *mysql.Conn) {
 }
 
 // ExecuteOnTablet executes a write query on specified vttablet
-// It should always be called with a master tablet for the keyspace/shard
+// It should always be called with a primary tablet for the keyspace/shard
 func ExecuteOnTablet(t *testing.T, query string, vttablet cluster.Vttablet, ks string, expectFail bool) {
 	_, _ = vttablet.VttabletProcess.QueryTablet("begin", ks, true)
 	_, err := vttablet.VttabletProcess.QueryTablet(query, ks, true)
@@ -410,7 +409,7 @@ func checkThrottlerServiceMaxRates(t *testing.T, server string, names []string, 
 	startTime := time.Now()
 	msg := fmt.Sprintf("%d active throttler(s)", len(names))
 	for {
-		output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ThrottlerMaxRates", "--server", server)
+		output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ThrottlerMaxRates", "--", "--server", server)
 		require.Nil(t, err)
 		if strings.Contains(output, msg) || (time.Now().After(startTime.Add(2 * time.Minute))) {
 			break
@@ -426,11 +425,11 @@ func checkThrottlerServiceMaxRates(t *testing.T, server string, names []string, 
 
 	// Check that it's possible to change the max rate on the throttler.
 	newRate := "unlimited"
-	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ThrottlerSetMaxRate", "--server", server, newRate)
+	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ThrottlerSetMaxRate", "--", "--server", server, newRate)
 	require.Nil(t, err)
 	assert.Contains(t, output, msg)
 
-	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ThrottlerMaxRates", "--server", server)
+	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ThrottlerMaxRates", "--", "--server", server)
 	require.Nil(t, err)
 	for _, name := range names {
 		str := fmt.Sprintf("| %s | %s |", name, newRate)
@@ -442,7 +441,7 @@ func checkThrottlerServiceMaxRates(t *testing.T, server string, names []string, 
 // checkThrottlerServiceConfiguration checks the vtctl (Get|Update|Reset)ThrottlerConfiguration commands.
 func checkThrottlerServiceConfiguration(t *testing.T, server string, names []string, ci cluster.LocalProcessCluster) {
 	output, err := ci.VtctlclientProcess.ExecuteCommandWithOutput(
-		"UpdateThrottlerConfiguration", "--server", server,
+		"UpdateThrottlerConfiguration", "--", "--server", server,
 		"--copy_zero_values",
 		"target_replication_lag_sec:12345 "+
 			"max_replication_lag_sec:65789 "+
@@ -462,7 +461,7 @@ func checkThrottlerServiceConfiguration(t *testing.T, server string, names []str
 	msg := fmt.Sprintf("%d active throttler(s)", len(names))
 	assert.Contains(t, output, msg)
 
-	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("GetThrottlerConfiguration", "--server", server)
+	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("GetThrottlerConfiguration", "--", "--server", server)
 	require.Nil(t, err)
 	for _, name := range names {
 		str := fmt.Sprintf("| %s | target_replication_lag_sec:12345 ", name)
@@ -472,12 +471,12 @@ func checkThrottlerServiceConfiguration(t *testing.T, server string, names []str
 	assert.Contains(t, output, msg)
 
 	// Reset clears our configuration values.
-	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ResetThrottlerConfiguration", "--server", server)
+	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("ResetThrottlerConfiguration", "--", "--server", server)
 	require.Nil(t, err)
 	assert.Contains(t, output, msg)
 
 	// Check that the reset configuration no longer has our values.
-	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("GetThrottlerConfiguration", "--server", server)
+	output, err = ci.VtctlclientProcess.ExecuteCommandWithOutput("GetThrottlerConfiguration", "--", "--server", server)
 	require.Nil(t, err)
 	assert.NotContains(t, output, "target_replication_lag_sec:12345")
 	assert.Contains(t, output, msg)

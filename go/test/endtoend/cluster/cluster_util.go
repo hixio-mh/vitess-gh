@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/mysql"
 	tabletpb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/vtgate/vtgateconn"
@@ -58,23 +59,35 @@ func (tablet *Vttablet) Restart() error {
 	return tablet.MysqlctldProcess.Start()
 }
 
+// RestartOnlyTablet restarts vttablet, but not the underlying mysql instance
+func (tablet *Vttablet) RestartOnlyTablet() error {
+	err := tablet.VttabletProcess.TearDown()
+	if err != nil {
+		return err
+	}
+
+	tablet.VttabletProcess.ServingStatus = "SERVING"
+
+	return tablet.VttabletProcess.Setup()
+}
+
 // ValidateTabletRestart restarts the tablet and validate error if there is any.
 func (tablet *Vttablet) ValidateTabletRestart(t *testing.T) {
 	require.Nilf(t, tablet.Restart(), "tablet restart failed")
 }
 
-// GetMasterPosition gets the master position of required vttablet
-func GetMasterPosition(t *testing.T, vttablet Vttablet, hostname string) (string, string) {
+// GetPrimaryPosition gets the executed replication position of given vttablet
+func GetPrimaryPosition(t *testing.T, vttablet Vttablet, hostname string) (string, string) {
 	ctx := context.Background()
 	vtablet := getTablet(vttablet.GrpcPort, hostname)
-	pos, err := tmClient.MasterPosition(ctx, vtablet)
+	pos, err := tmClient.PrimaryPosition(ctx, vtablet)
 	require.Nil(t, err)
 	gtID := strings.SplitAfter(pos, "/")[1]
 	return pos, gtID
 }
 
-// VerifyRowsInTabletForTable Verify total number of rows in a table
-// this is used to check replication caught up the changes from master
+// VerifyRowsInTabletForTable verifies the total number of rows in a table.
+// This is used to check that replication has caught up with the changes on primary.
 func VerifyRowsInTabletForTable(t *testing.T, vttablet *Vttablet, ksName string, expectedRows int, tableName string) {
 	timeout := time.Now().Add(10 * time.Second)
 	for time.Now().Before(timeout) {
@@ -165,6 +178,18 @@ func getTablet(tabletGrpcPort int, hostname string) *tabletpb.Tablet {
 	return &tabletpb.Tablet{Hostname: hostname, PortMap: portMap}
 }
 
+func filterResultForWarning(input string) string {
+	lines := strings.Split(input, "\n")
+	var result string
+	for _, line := range lines {
+		if strings.Contains(line, "WARNING: vtctl should only be used for VDiff workflows") {
+			continue
+		}
+		result = result + line + "\n"
+	}
+	return result
+}
+
 func filterResultWhenRunsForCoverage(input string) string {
 	if !*isCoverage {
 		return input
@@ -185,9 +210,9 @@ func filterResultWhenRunsForCoverage(input string) string {
 
 // WaitForReplicationPos will wait for replication position to catch-up
 func WaitForReplicationPos(t *testing.T, tabletA *Vttablet, tabletB *Vttablet, hostname string, timeout float64) {
-	replicationPosA, _ := GetMasterPosition(t, *tabletA, hostname)
+	replicationPosA, _ := GetPrimaryPosition(t, *tabletA, hostname)
 	for {
-		replicationPosB, _ := GetMasterPosition(t, *tabletB, hostname)
+		replicationPosB, _ := GetPrimaryPosition(t, *tabletB, hostname)
 		if positionAtLeast(t, tabletA, replicationPosB, replicationPosA) {
 			break
 		}
@@ -239,4 +264,20 @@ func NewConnParams(port int, password, socketPath, keyspace string) mysql.ConnPa
 
 	return cp
 
+}
+
+func filterDoubleDashArgs(args []string, version int) (filtered []string) {
+	if version > 13 {
+		return args
+	}
+
+	for _, arg := range args {
+		if arg == "--" {
+			continue
+		}
+
+		filtered = append(filtered, arg)
+	}
+
+	return filtered
 }

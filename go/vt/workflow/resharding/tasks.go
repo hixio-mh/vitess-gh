@@ -21,7 +21,7 @@ import (
 	"log"
 	"strings"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/vt/automation"
 	"vitess.io/vitess/go/vt/topo/topoproto"
@@ -156,7 +156,7 @@ func (hw *horizontalReshardingWorkflow) runMigrate(ctx context.Context, t *workf
 
 	if servedType != topodatapb.TabletType_RDONLY &&
 		servedType != topodatapb.TabletType_REPLICA &&
-		servedType != topodatapb.TabletType_MASTER {
+		servedType != topodatapb.TabletType_PRIMARY {
 		return fmt.Errorf("wrong served type to be migrated: %v", servedTypeStr)
 	}
 

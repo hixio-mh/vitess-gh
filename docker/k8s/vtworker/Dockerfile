@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG VT_BASE_VER
+ARG VT_BASE_VER=latest
+ARG DEBIAN_VER=stable-slim
 
 FROM vitess/k8s:${VT_BASE_VER} AS k8s
 
-FROM debian:buster-slim
+FROM debian:${DEBIAN_VER}
 
 # Set up Vitess environment (just enough to run pre-built Go binaries)
 ENV VTROOT /vt

@@ -25,6 +25,8 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
 
 	"vitess.io/vitess/go/vt/proto/vtrpc"
@@ -32,9 +34,8 @@ import (
 	"vitess.io/vitess/go/vt/vttablet/tmclient"
 	"vitess.io/vitess/go/vt/wrangler"
 
-	"golang.org/x/net/context"
+	"context"
 
-	"github.com/golang/protobuf/proto"
 	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/grpcclient"
@@ -735,16 +736,16 @@ func CreateConsistentTransactions(ctx context.Context, tablet *topo.TabletInfo, 
 	// Lock all tables with a read lock to pause replication
 	err := tm.LockTables(ctx, tablet.Tablet)
 	if err != nil {
-		return nil, "", vterrors.Wrapf(err, "could not lock tables on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+		return nil, "", vterrors.Wrapf(err, "could not lock tables on %v", tablet.Tablet)
 	}
 	defer func() {
 		tm := tmclient.NewTabletManagerClient()
 		defer tm.Close()
 		tm.UnlockTables(ctx, tablet.Tablet)
-		wr.Logger().Infof("tables unlocked on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+		wr.Logger().Infof("tables unlocked on %v", tablet.Tablet)
 	}()
 
-	wr.Logger().Infof("tables locked on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+	wr.Logger().Infof("tables locked on %v", tablet.Tablet)
 	target := CreateTargetFrom(tablet.Tablet)
 
 	// Create transactions
@@ -752,12 +753,12 @@ func CreateConsistentTransactions(ctx context.Context, tablet *topo.TabletInfo, 
 	defer queryService.Close(ctx)
 	connections, err := createTransactions(ctx, numberOfScanners, wr, cleaner, queryService, target, tablet.Tablet)
 	if err != nil {
-		return nil, "", vterrors.Wrapf(err, "failed to create transactions on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+		return nil, "", vterrors.Wrapf(err, "failed to create transactions on %v", tablet.Tablet)
 	}
 	wr.Logger().Infof("transactions created on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
-	executedGtid, err := tm.MasterPosition(ctx, tablet.Tablet)
+	executedGtid, err := tm.PrimaryPosition(ctx, tablet.Tablet)
 	if err != nil {
-		return nil, "", vterrors.Wrapf(err, "could not read executed GTID set on %v", topoproto.TabletAliasString(tablet.Tablet.Alias))
+		return nil, "", vterrors.Wrapf(err, "could not read executed GTID set on %v", tablet.Tablet)
 	}
 
 	return connections, executedGtid, nil

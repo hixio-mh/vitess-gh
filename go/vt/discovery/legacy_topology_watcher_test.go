@@ -21,8 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"context"
+
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/vt/logutil"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/topo"
@@ -136,7 +138,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	}
 	tw.loadTablets()
 
-	// If RefreshKnownTablets is disabled, only the new tablet is read
+	// If refreshKnownTablets is disabled, only the new tablet is read
 	// from the topo
 	if refreshKnownTablets {
 		counts = checkLegacyOpCounts(t, tw, counts, map[string]int64{"ListTablets": 1, "GetTablet": 2, "AddTablet": 1})
@@ -152,7 +154,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 		t.Errorf("fhc.GetAllTablets() = %+v; want %+v", allTablets, tablet2)
 	}
 
-	// Load the tablets again to show that when RefreshKnownTablets is disabled,
+	// Load the tablets again to show that when refreshKnownTablets is disabled,
 	// only the list is read from the topo and the checksum doesn't change
 	tw.loadTablets()
 	if refreshKnownTablets {
@@ -165,7 +167,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	// same tablet, different port, should update (previous
 	// one should go away, new one be added)
 	//
-	// if RefreshKnownTablets is disabled, this case is *not*
+	// if refreshKnownTablets is disabled, this case is *not*
 	// detected and the tablet remains in the topo using the
 	// old key
 	origTablet := proto.Clone(tablet).(*topodatapb.Tablet)
@@ -207,7 +209,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	// trigger a ReplaceTablet in loadTablets because the uid does not
 	// match.
 	//
-	// This case *is* detected even if RefreshKnownTablets is false
+	// This case *is* detected even if refreshKnownTablets is false
 	// because the delete tablet / create tablet sequence causes the
 	// list of tablets to change and therefore the change is detected.
 	if err := ts.DeleteTablet(context.Background(), tablet2.Alias); err != nil {
@@ -217,7 +219,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	if err := ts.CreateTablet(context.Background(), tablet2); err != nil {
 		t.Fatalf("CreateTablet failed: %v", err)
 	}
-	if err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
+	if _, err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
 		t.Fatalf("FixShardReplication failed: %v", err)
 	}
 	tw.loadTablets()
@@ -239,8 +241,8 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	// tablet2 happens to land on the host:port that tablet 1 used to be on.
 	// This can only be tested when we refresh known tablets.
 	if refreshKnownTablets {
-		origTablet := *tablet
-		origTablet2 := *tablet2
+		origTablet := proto.Clone(tablet).(*topodatapb.Tablet)
+		origTablet2 := proto.Clone(tablet2).(*topodatapb.Tablet)
 
 		if _, err := ts.UpdateTabletFields(context.Background(), tablet2.Alias, func(t *topodatapb.Tablet) error {
 			t.Hostname = tablet.Hostname
@@ -289,7 +291,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	if err := ts.DeleteTablet(context.Background(), tablet.Alias); err != nil {
 		t.Fatalf("DeleteTablet failed: %v", err)
 	}
-	if err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
+	if _, err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
 		t.Fatalf("FixShardReplication failed: %v", err)
 	}
 	tw.loadTablets()
@@ -314,7 +316,7 @@ func checkLegacyWatcher(t *testing.T, cellTablets, refreshKnownTablets bool) {
 	if err := ts.DeleteTablet(context.Background(), tablet2.Alias); err != nil {
 		t.Fatalf("DeleteTablet failed: %v", err)
 	}
-	if err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
+	if _, err := topo.FixShardReplication(context.Background(), ts, logger, "aa", "keyspace", "shard"); err != nil {
 		t.Fatalf("FixShardReplication failed: %v", err)
 	}
 	tw.loadTablets()

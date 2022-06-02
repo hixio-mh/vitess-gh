@@ -20,12 +20,13 @@ limitations under the License.
 package vtexplain
 
 import (
+	"context"
 	"fmt"
 
+	"vitess.io/vitess/go/cache"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/json2"
@@ -37,6 +38,7 @@ import (
 	"vitess.io/vitess/go/vt/vtgate/engine"
 	"vitess.io/vitess/go/vt/vttablet/queryservice"
 
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
@@ -56,7 +58,7 @@ var (
 func initVtgateExecutor(vSchemaStr, ksShardMapStr string, opts *Options) error {
 	explainTopo = &ExplainTopo{NumShards: opts.NumShards}
 	explainTopo.TopoServer = memorytopo.NewServer(vtexplainCell)
-	healthCheck = discovery.NewFakeHealthCheck()
+	healthCheck = discovery.NewFakeHealthCheck(nil)
 
 	resolver := newFakeResolver(opts, explainTopo, vtexplainCell)
 
@@ -67,9 +69,16 @@ func initVtgateExecutor(vSchemaStr, ksShardMapStr string, opts *Options) error {
 
 	vtgateSession.TargetString = opts.Target
 
+	if opts.PlannerVersion != querypb.ExecuteOptions_DEFAULT_PLANNER {
+		if vtgateSession.Options == nil {
+			vtgateSession.Options = &querypb.ExecuteOptions{}
+		}
+		vtgateSession.Options.PlannerVersion = opts.PlannerVersion
+	}
+
 	streamSize := 10
-	queryPlanCacheSize := int64(10)
-	vtgateExecutor = vtgate.NewExecutor(context.Background(), explainTopo, vtexplainCell, resolver, opts.Normalize, streamSize, queryPlanCacheSize)
+	var schemaTracker vtgate.SchemaInfo // no schema tracker for these tests
+	vtgateExecutor = vtgate.NewExecutor(context.Background(), explainTopo, vtexplainCell, resolver, opts.Normalize, false /*do not warn for sharded only*/, streamSize, cache.DefaultConfig, schemaTracker, false /*no-scatter*/)
 
 	return nil
 }
@@ -77,7 +86,7 @@ func initVtgateExecutor(vSchemaStr, ksShardMapStr string, opts *Options) error {
 func newFakeResolver(opts *Options, serv srvtopo.Server, cell string) *vtgate.Resolver {
 	ctx := context.Background()
 	gw := vtgate.NewTabletGateway(ctx, healthCheck, serv, cell)
-	_ = gw.WaitForTablets(ctx, []topodatapb.TabletType{topodatapb.TabletType_REPLICA})
+	_ = gw.WaitForTablets([]topodatapb.TabletType{topodatapb.TabletType_REPLICA})
 
 	txMode := vtgatepb.TransactionMode_MULTI
 	if opts.ExecutionMode == ModeTwoPC {
@@ -122,7 +131,7 @@ func buildTopology(opts *Options, vschemaStr string, ksShardMapStr string, numSh
 			hostname := fmt.Sprintf("%s/%s", ks, shard.Name)
 			log.Infof("registering test tablet %s for keyspace %s shard %s", hostname, ks, shard.Name)
 
-			tablet := healthCheck.AddFakeTablet(vtexplainCell, hostname, 1, ks, shard.Name, topodatapb.TabletType_MASTER, true, 1, nil, func(t *topodatapb.Tablet) queryservice.QueryService {
+			tablet := healthCheck.AddFakeTablet(vtexplainCell, hostname, 1, ks, shard.Name, topodatapb.TabletType_PRIMARY, true, 1, nil, func(t *topodatapb.Tablet) queryservice.QueryService {
 				return newTablet(opts, t)
 			})
 			explainTopo.TabletConns[hostname] = tablet.(*explainTablet)
@@ -200,11 +209,12 @@ func vtgateExecute(sql string) ([]*engine.Plan, map[string]*TabletActions, error
 	}
 
 	var plans []*engine.Plan
-	for _, item := range planCache.Items() {
-		plan := item.Value.(*engine.Plan)
+	planCache.ForEach(func(value any) bool {
+		plan := value.(*engine.Plan)
 		plan.ExecTime = 0
 		plans = append(plans, plan)
-	}
+		return true
+	})
 	planCache.Clear()
 
 	tabletActions := make(map[string]*TabletActions)
@@ -213,13 +223,18 @@ func vtgateExecute(sql string) ([]*engine.Plan, map[string]*TabletActions, error
 			continue
 		}
 
-		tabletActions[shard] = &TabletActions{
-			TabletQueries: tc.tabletQueries,
-			MysqlQueries:  tc.mysqlQueries,
-		}
+		func() {
+			tc.mu.Lock()
+			defer tc.mu.Unlock()
 
-		tc.tabletQueries = nil
-		tc.mysqlQueries = nil
+			tabletActions[shard] = &TabletActions{
+				TabletQueries: tc.tabletQueries,
+				MysqlQueries:  tc.mysqlQueries,
+			}
+
+			tc.tabletQueries = nil
+			tc.mysqlQueries = nil
+		}()
 	}
 
 	return plans, tabletActions, nil

@@ -28,7 +28,8 @@ import (
 	"vitess.io/vitess/go/vt/proto/topodata"
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/wrangler"
@@ -192,7 +193,7 @@ func keyspacesWithServedFrom(ctx context.Context, wr *wrangler.Wrangler) ([]stri
 	return result, nil
 }
 
-func interactiveVerticalSplitClone(ctx context.Context, wi *Instance, wr *wrangler.Wrangler, w http.ResponseWriter, r *http.Request) (Worker, *template.Template, map[string]interface{}, error) {
+func interactiveVerticalSplitClone(ctx context.Context, wi *Instance, wr *wrangler.Wrangler, w http.ResponseWriter, r *http.Request) (Worker, *template.Template, map[string]any, error) {
 	if err := r.ParseForm(); err != nil {
 		return nil, nil, nil, vterrors.Wrap(err, "cannot parse form")
 	}
@@ -200,7 +201,7 @@ func interactiveVerticalSplitClone(ctx context.Context, wi *Instance, wr *wrangl
 	keyspace := r.FormValue("keyspace")
 	if keyspace == "" {
 		// display the list of possible keyspaces to choose from
-		result := make(map[string]interface{})
+		result := make(map[string]any)
 		keyspaces, err := keyspacesWithServedFrom(ctx, wr)
 		if err != nil {
 			result["Error"] = err.Error()
@@ -213,7 +214,7 @@ func interactiveVerticalSplitClone(ctx context.Context, wi *Instance, wr *wrangl
 	tables := r.FormValue("tables")
 	if tables == "" {
 		// display the input form
-		result := make(map[string]interface{})
+		result := make(map[string]any)
 		result["Keyspace"] = keyspace
 		result["DefaultOnline"] = defaultOnline
 		result["DefaultOffline"] = defaultOffline

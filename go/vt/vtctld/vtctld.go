@@ -19,6 +19,7 @@ limitations under the License.
 package vtctld
 
 import (
+	"context"
 	"flag"
 	"net/http"
 	"strings"
@@ -26,18 +27,22 @@ import (
 
 	rice "github.com/GeertJohan/go.rice"
 
-	"golang.org/x/net/context"
 	"vitess.io/vitess/go/vt/log"
 
 	"vitess.io/vitess/go/acl"
 	"vitess.io/vitess/go/vt/topo"
+	"vitess.io/vitess/go/vt/vtctl/reparentutil"
 	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	vtctldatapb "vitess.io/vitess/go/vt/proto/vtctldata"
 )
 
 var (
 	enableRealtimeStats = flag.Bool("enable_realtime_stats", false, "Required for the Realtime Stats view. If set, vtctld will maintain a streaming RPC to each tablet (in all cells) to gather the realtime health stats.")
+	enableUI            = flag.Bool("enable_vtctld_ui", true, "If true, the vtctld web interface will be enabled. Default is true.")
+	durabilityPolicy    = flag.String("durability_policy", "none", "type of durability to enforce. Default is none. Other values are dictated by registered plugins")
+	sanitizeLogMessages = flag.Bool("vtctld_sanitize_log_messages", false, "When true, vtctld sanitizes logging.")
 
 	_ = flag.String("web_dir", "", "NOT USED, here for backward compatibility")
 	_ = flag.String("web_dir2", "", "NOT USED, here for backward compatibility")
@@ -48,54 +53,60 @@ const (
 )
 
 // InitVtctld initializes all the vtctld functionality.
-func InitVtctld(ts *topo.Server) {
+func InitVtctld(ts *topo.Server) error {
+	err := reparentutil.SetDurabilityPolicy(*durabilityPolicy)
+	if err != nil {
+		log.Errorf("error in setting durability policy: %v", err)
+		return err
+	}
+
 	actionRepo := NewActionRepository(ts)
 
 	// keyspace actions
 	actionRepo.RegisterKeyspaceAction("ValidateKeyspace",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string) (string, error) {
 			return "", wr.ValidateKeyspace(ctx, keyspace, false)
 		})
 
 	actionRepo.RegisterKeyspaceAction("ValidateSchemaKeyspace",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string, r *http.Request) (string, error) {
-			return "", wr.ValidateSchemaKeyspace(ctx, keyspace, nil, false, false)
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string) (string, error) {
+			return "", wr.ValidateSchemaKeyspace(ctx, keyspace, nil /*excludeTables*/, false /*includeViews*/, false /*skipNoPrimary*/, false /*includeVSchema*/)
 		})
 
 	actionRepo.RegisterKeyspaceAction("ValidateVersionKeyspace",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string) (string, error) {
 			return "", wr.ValidateVersionKeyspace(ctx, keyspace)
 		})
 
 	actionRepo.RegisterKeyspaceAction("ValidatePermissionsKeyspace",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string) (string, error) {
 			return "", wr.ValidatePermissionsKeyspace(ctx, keyspace)
 		})
 
 	// shard actions
 	actionRepo.RegisterShardAction("ValidateShard",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string) (string, error) {
 			return "", wr.ValidateShard(ctx, keyspace, shard, false)
 		})
 
 	actionRepo.RegisterShardAction("ValidateSchemaShard",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string, r *http.Request) (string, error) {
-			return "", wr.ValidateSchemaShard(ctx, keyspace, shard, nil, false)
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string) (string, error) {
+			return "", wr.ValidateSchemaShard(ctx, keyspace, shard, nil, false, false /*includeVSchema*/)
 		})
 
 	actionRepo.RegisterShardAction("ValidateVersionShard",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string) (string, error) {
 			return "", wr.ValidateVersionShard(ctx, keyspace, shard)
 		})
 
 	actionRepo.RegisterShardAction("ValidatePermissionsShard",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string) (string, error) {
 			return "", wr.ValidatePermissionsShard(ctx, keyspace, shard)
 		})
 
 	// tablet actions
 	actionRepo.RegisterTabletAction("Ping", "",
-		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias) (string, error) {
 			ti, err := wr.TopoServer().GetTablet(ctx, tabletAlias)
 			if err != nil {
 				return "", err
@@ -104,7 +115,7 @@ func InitVtctld(ts *topo.Server) {
 		})
 
 	actionRepo.RegisterTabletAction("RefreshState", acl.ADMIN,
-		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias) (string, error) {
 			ti, err := wr.TopoServer().GetTablet(ctx, tabletAlias)
 			if err != nil {
 				return "", err
@@ -113,13 +124,16 @@ func InitVtctld(ts *topo.Server) {
 		})
 
 	actionRepo.RegisterTabletAction("DeleteTablet", acl.ADMIN,
-		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias) (string, error) {
 			return "", wr.DeleteTablet(ctx, tabletAlias, false)
 		})
 
 	actionRepo.RegisterTabletAction("ReloadSchema", acl.ADMIN,
-		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias, r *http.Request) (string, error) {
-			return "", wr.ReloadSchema(ctx, tabletAlias)
+		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias) (string, error) {
+			_, err := wr.VtctldServer().ReloadSchema(ctx, &vtctldatapb.ReloadSchemaRequest{
+				TabletAlias: tabletAlias,
+			})
+			return "", err
 		})
 
 	// Anything unrecognized gets redirected to the main app page.
@@ -128,38 +142,7 @@ func InitVtctld(ts *topo.Server) {
 	})
 
 	// Serve the static files for the vtctld2 web app
-	http.HandleFunc(appPrefix, func(w http.ResponseWriter, r *http.Request) {
-		// Strip the prefix.
-		parts := strings.SplitN(r.URL.Path, "/", 3)
-		if len(parts) != 3 {
-			http.NotFound(w, r)
-			return
-		}
-		rest := parts[2]
-		if rest == "" {
-			rest = "index.html"
-		}
-
-		riceBox, err := rice.FindBox("../../../web/vtctld2/app")
-		if err != nil {
-			log.Errorf("Unable to open rice box %s", err)
-			http.NotFound(w, r)
-		}
-		fileToServe, err := riceBox.Open(rest)
-		if err != nil {
-			if !strings.ContainsAny(rest, "/.") {
-				//This is a virtual route so pass index.html
-				fileToServe, err = riceBox.Open("index.html")
-			}
-			if err != nil {
-				log.Errorf("Unable to open file from rice box %s : %s", rest, err)
-				http.NotFound(w, r)
-			}
-		}
-		if fileToServe != nil {
-			http.ServeContent(w, r, rest, time.Now(), fileToServe)
-		}
-	})
+	http.HandleFunc(appPrefix, webAppHandler)
 
 	var realtimeStats *realtimeStats
 	if *enableRealtimeStats {
@@ -181,4 +164,44 @@ func InitVtctld(ts *topo.Server) {
 
 	// Setup reverse proxy for all vttablets through /vttablet/.
 	initVTTabletRedirection(ts)
+
+	return nil
+}
+
+func webAppHandler(w http.ResponseWriter, r *http.Request) {
+	if !*enableUI {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Strip the prefix.
+	parts := strings.SplitN(r.URL.Path, "/", 3)
+	if len(parts) != 3 {
+		http.NotFound(w, r)
+		return
+	}
+	rest := parts[2]
+	if rest == "" {
+		rest = "index.html"
+	}
+
+	riceBox, err := rice.FindBox("../../../web/vtctld2/app")
+	if err != nil {
+		log.Errorf("Unable to open rice box %s", err)
+		http.NotFound(w, r)
+	}
+	fileToServe, err := riceBox.Open(rest)
+	if err != nil {
+		if !strings.ContainsAny(rest, "/.") {
+			//This is a virtual route so pass index.html
+			fileToServe, err = riceBox.Open("index.html")
+		}
+		if err != nil {
+			log.Errorf("Unable to open file from rice box %s : %s", rest, err)
+			http.NotFound(w, r)
+		}
+	}
+	if fileToServe != nil {
+		http.ServeContent(w, r, rest, time.Now(), fileToServe)
+	}
 }

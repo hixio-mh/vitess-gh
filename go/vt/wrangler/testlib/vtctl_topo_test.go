@@ -17,15 +17,15 @@ limitations under the License.
 package testlib
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
 
-	"github.com/golang/protobuf/proto"
+	"context"
+
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -63,7 +63,7 @@ func TestVtctlTopoCommands(t *testing.T) {
 	vp := NewVtctlPipe(t, ts)
 	defer vp.Close()
 
-	tmp, err := ioutil.TempDir("", "vtctltopotest")
+	tmp, err := os.MkdirTemp("", "vtctltopotest")
 	if err != nil {
 		t.Fatalf("TempDir failed: %v", err)
 	}
@@ -71,9 +71,9 @@ func TestVtctlTopoCommands(t *testing.T) {
 
 	// Test TopoCat.
 	testVtctlTopoCommand(t, vp, []string{"TopoCat", "-long", "-decode_proto", "/keyspaces/*/Keyspace"}, `path=/keyspaces/ks1/Keyspace version=V
-sharding_column_name: "col1"
+sharding_column_name:"col1"
 path=/keyspaces/ks2/Keyspace version=V
-sharding_column_name: "col2"
+sharding_column_name:"col2"
 `)
 
 	// Test TopoCp from topo to disk.
@@ -82,7 +82,7 @@ sharding_column_name: "col2"
 	if err != nil {
 		t.Fatalf("TopoCp(/keyspaces/ks1/Keyspace) failed: %v", err)
 	}
-	contents, err := ioutil.ReadFile(ksFile)
+	contents, err := os.ReadFile(ksFile)
 	if err != nil {
 		t.Fatalf("copy failed: %v", err)
 	}

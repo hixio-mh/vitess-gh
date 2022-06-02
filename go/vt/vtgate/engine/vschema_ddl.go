@@ -31,7 +31,7 @@ var _ Primitive = (*AlterVSchema)(nil)
 type AlterVSchema struct {
 	Keyspace *vindexes.Keyspace
 
-	DDL *sqlparser.DDL
+	AlterVschemaDDL *sqlparser.AlterVschema
 
 	noTxNeeded
 
@@ -42,42 +42,46 @@ func (v *AlterVSchema) description() PrimitiveDescription {
 	return PrimitiveDescription{
 		OperatorType: "AlterVSchema",
 		Keyspace:     v.Keyspace,
-		Other: map[string]interface{}{
-			"query": sqlparser.String(v.DDL),
+		Other: map[string]any{
+			"query": sqlparser.String(v.AlterVschemaDDL),
 		},
 	}
 }
 
-//RouteType implements the Primitive interface
+// RouteType implements the Primitive interface
 func (v *AlterVSchema) RouteType() string {
 	return "AlterVSchema"
 }
 
-//GetKeyspaceName implements the Primitive interface
+// GetKeyspaceName implements the Primitive interface
 func (v *AlterVSchema) GetKeyspaceName() string {
 	return v.Keyspace.Name
 }
 
-//GetTableName implements the Primitive interface
+// GetTableName implements the Primitive interface
 func (v *AlterVSchema) GetTableName() string {
-	return v.DDL.Table.Name.String()
+	return v.AlterVschemaDDL.Table.Name.String()
 }
 
-//Execute implements the Primitive interface
-func (v *AlterVSchema) Execute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool) (*sqltypes.Result, error) {
-	err := vcursor.ExecuteVSchema(v.Keyspace.Name, v.DDL)
+// TryExecute implements the Primitive interface
+func (v *AlterVSchema) TryExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+	err := vcursor.ExecuteVSchema(v.Keyspace.Name, v.AlterVschemaDDL)
 	if err != nil {
 		return nil, err
 	}
 	return &sqltypes.Result{}, nil
 }
 
-//StreamExecute implements the Primitive interface
-func (v *AlterVSchema) StreamExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantields bool, callback func(*sqltypes.Result) error) error {
-	return vterrors.Errorf(vtrpcpb.Code_INTERNAL, "not reachable") // TODO: systay - this should work
+// TryStreamExecute implements the Primitive interface
+func (v *AlterVSchema) TryStreamExecute(vcursor VCursor, bindVars map[string]*query.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+	res, err := v.TryExecute(vcursor, bindVars, wantfields)
+	if err != nil {
+		return err
+	}
+	return callback(res)
 }
 
-//GetFields implements the Primitive interface
+// GetFields implements the Primitive interface
 func (v *AlterVSchema) GetFields(vcursor VCursor, bindVars map[string]*query.BindVariable) (*sqltypes.Result, error) {
-	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "not reachable") // TODO: systay - this should work
+	return nil, vterrors.NewErrorf(vtrpcpb.Code_UNIMPLEMENTED, vterrors.UnsupportedPS, "This command is not supported in the prepared statement protocol yet")
 }

@@ -50,10 +50,11 @@ var (
 
 // ReplTracker tracks replication lag.
 type ReplTracker struct {
-	mode string
+	mode           string
+	forceHeartbeat bool
 
-	mu       sync.Mutex
-	isMaster bool
+	mu        sync.Mutex
+	isPrimary bool
 
 	hw     *heartbeatWriter
 	hr     *heartbeatReader
@@ -61,42 +62,46 @@ type ReplTracker struct {
 }
 
 // NewReplTracker creates a new ReplTracker.
-func NewReplTracker(env tabletenv.Env, alias topodatapb.TabletAlias) *ReplTracker {
+func NewReplTracker(env tabletenv.Env, alias *topodatapb.TabletAlias) *ReplTracker {
 	return &ReplTracker{
-		mode:   env.Config().ReplicationTracker.Mode,
-		hw:     newHeartbeatWriter(env, alias),
-		hr:     newHeartbeatReader(env),
-		poller: &poller{},
+		mode:           env.Config().ReplicationTracker.Mode,
+		forceHeartbeat: env.Config().EnableLagThrottler,
+		hw:             newHeartbeatWriter(env, alias),
+		hr:             newHeartbeatReader(env),
+		poller:         &poller{},
 	}
 }
 
 // InitDBConfig initializes the target name.
-func (rt *ReplTracker) InitDBConfig(target querypb.Target, mysqld mysqlctl.MysqlDaemon) {
+func (rt *ReplTracker) InitDBConfig(target *querypb.Target, mysqld mysqlctl.MysqlDaemon) {
 	rt.hw.InitDBConfig(target)
 	rt.hr.InitDBConfig(target)
 	rt.poller.InitDBConfig(mysqld)
 }
 
-// MakeMaster must be called if the tablet type becomes MASTER.
-func (rt *ReplTracker) MakeMaster() {
+// MakePrimary must be called if the tablet type becomes PRIMARY.
+func (rt *ReplTracker) MakePrimary() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	log.Info("Replication Tracker: going into master mode")
+	log.Info("Replication Tracker: going into primary mode")
 
-	rt.isMaster = true
+	rt.isPrimary = true
 	if rt.mode == tabletenv.Heartbeat {
 		rt.hr.Close()
 		rt.hw.Open()
 	}
+	if rt.forceHeartbeat {
+		rt.hw.Open()
+	}
 }
 
-// MakeNonMaster must be called if the tablet type becomes non-MASTER.
-func (rt *ReplTracker) MakeNonMaster() {
+// MakeNonPrimary must be called if the tablet type becomes non-PRIMARY.
+func (rt *ReplTracker) MakeNonPrimary() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	log.Info("Replication Tracker: going into non-master mode")
+	log.Info("Replication Tracker: going into non-primary mode")
 
-	rt.isMaster = false
+	rt.isPrimary = false
 	switch rt.mode {
 	case tabletenv.Heartbeat:
 		rt.hw.Close()
@@ -104,6 +109,9 @@ func (rt *ReplTracker) MakeNonMaster() {
 	case tabletenv.Polling:
 		// Run the status once to pre-initialize values.
 		rt.poller.Status()
+	}
+	if rt.forceHeartbeat {
+		rt.hw.Close()
 	}
 }
 
@@ -120,11 +128,17 @@ func (rt *ReplTracker) Status() (time.Duration, error) {
 	defer rt.mu.Unlock()
 
 	switch {
-	case rt.isMaster || rt.mode == tabletenv.Disable:
+	case rt.isPrimary || rt.mode == tabletenv.Disable:
 		return 0, nil
 	case rt.mode == tabletenv.Heartbeat:
 		return rt.hr.Status()
 	}
 	// rt.mode == tabletenv.Poller
 	return rt.poller.Status()
+}
+
+// EnableHeartbeat enables or disables writes of heartbeat. This functionality
+// is only used by tests.
+func (rt *ReplTracker) EnableHeartbeat(enable bool) {
+	rt.hw.enableWrites(enable)
 }

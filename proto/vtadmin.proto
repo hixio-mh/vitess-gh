@@ -1,0 +1,549 @@
+/*
+Copyright 2020 The Vitess Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// This package contains the types used by VTAdmin (and later an RPC service).
+
+syntax = "proto3";
+option go_package = "vitess.io/vitess/go/vt/proto/vtadmin";
+
+package vtadmin;
+
+import "mysqlctl.proto";
+import "tabletmanagerdata.proto";
+import "topodata.proto";
+import "vschema.proto";
+import "vtctldata.proto";
+
+/* Services */
+
+// VTAdmin is the Vitess Admin API service. It provides RPCs that operate on
+// across a range of Vitess clusters.
+service VTAdmin {
+    // CreateKeyspace creates a new keyspace in the given cluster.
+    rpc CreateKeyspace(CreateKeyspaceRequest) returns (CreateKeyspaceResponse) {};
+    // CreateShard creates a new shard in the given cluster and keyspace.
+    rpc CreateShard(CreateShardRequest) returns (vtctldata.CreateShardResponse) {};
+    // DeleteKeyspace deletes a keyspace in the given cluster.
+    rpc DeleteKeyspace(DeleteKeyspaceRequest) returns (vtctldata.DeleteKeyspaceResponse) {};
+    // DeleteShard deletes one or more shards in the given cluster and keyspace.
+    rpc DeleteShards(DeleteShardsRequest) returns (vtctldata.DeleteShardsResponse) {};
+    // DeleteTablet deletes a tablet from the topology
+    rpc DeleteTablet(DeleteTabletRequest) returns (DeleteTabletResponse) {};
+    // FindSchema returns a single Schema that matches the provided table name
+    // across all specified clusters IDs. Not specifying a set of cluster IDs
+    // causes the search to span all configured clusters.
+    //
+    // An error occurs if either no table exists across any of the clusters with
+    // the specified table name, or if multiple tables exist with that name.
+    rpc FindSchema(FindSchemaRequest) returns (Schema) {};
+    // GetBackups returns backups grouped by cluster.
+    rpc GetBackups(GetBackupsRequest) returns (GetBackupsResponse) {};
+    // GetClusters returns all configured clusters.
+    rpc GetClusters(GetClustersRequest) returns (GetClustersResponse) {};
+    // GetGates returns all gates across all the specified clusters.
+    rpc GetGates(GetGatesRequest) returns (GetGatesResponse) {};
+    // GetKeyspace returns a keyspace by name in the specified cluster.
+    rpc GetKeyspace(GetKeyspaceRequest) returns (Keyspace) {};
+    // GetKeyspaces returns all keyspaces across the specified clusters.
+    rpc GetKeyspaces(GetKeyspacesRequest) returns (GetKeyspacesResponse) {};
+    // GetSchema returns the schema for the specified (cluster, keyspace, table)
+    // tuple.
+    rpc GetSchema(GetSchemaRequest) returns (Schema) {};
+    // GetSchemas returns all schemas across the specified clusters.
+    rpc GetSchemas(GetSchemasRequest) returns (GetSchemasResponse) {};
+    // GetShardReplicationPositions returns shard replication positions grouped
+    // by cluster.
+    rpc GetShardReplicationPositions(GetShardReplicationPositionsRequest) returns (GetShardReplicationPositionsResponse) {};
+    // GetSrvVSchema returns the SrvVSchema for the given cluster and cell.
+    rpc GetSrvVSchema (GetSrvVSchemaRequest) returns (SrvVSchema) {};
+    // GetSrvVSchemas returns all SrvVSchemas across all (or specified) clusters and cells.
+    rpc GetSrvVSchemas(GetSrvVSchemasRequest) returns (GetSrvVSchemasResponse) {};
+    // GetTablet looks up a tablet by hostname across all clusters and returns
+    // the result.
+    rpc GetTablet(GetTabletRequest) returns (Tablet) {};
+    // GetTablets returns all tablets across all the specified clusters.
+    rpc GetTablets(GetTabletsRequest) returns (GetTabletsResponse) {};
+    // GetVSchema returns a VSchema for the specified keyspace in the specified
+    // cluster.
+    rpc GetVSchema(GetVSchemaRequest) returns (VSchema) {};
+    // GetVSchemas returns the VSchemas for all specified clusters.
+    rpc GetVSchemas(GetVSchemasRequest) returns (GetVSchemasResponse) {};
+    // GetVtctlds returns the Vtctlds for all specified clusters.
+    rpc GetVtctlds(GetVtctldsRequest) returns (GetVtctldsResponse) {};
+    // GetWorkflow returns a single Workflow for a given cluster, keyspace, and
+    // workflow name.
+    rpc GetWorkflow(GetWorkflowRequest) returns (Workflow) {};
+    // GetWorkflows returns the Workflows for all specified clusters.
+    rpc GetWorkflows(GetWorkflowsRequest) returns (GetWorkflowsResponse) {};
+    // PingTablet checks that the specified tablet is awake and responding to RPCs. This command can be blocked by other in-flight operations.
+    rpc PingTablet(PingTabletRequest) returns (PingTabletResponse) {};
+    // RefreshState reloads the tablet record on the specified tablet.
+    rpc RefreshState(RefreshStateRequest) returns (RefreshStateResponse) {};
+    // ReparentTablet 
+    rpc ReparentTablet(ReparentTabletRequest) returns (ReparentTabletResponse) {};
+    // RunHealthCheck runs a health check on the tablet
+    rpc RunHealthCheck(RunHealthCheckRequest) returns (RunHealthCheckResponse) {};
+    // SetReadOnly will set the tablet to read only mode
+    rpc SetReadOnly(SetReadOnlyRequest) returns (SetReadOnlyResponse) {};
+    // SetReadWrite will set the tablet to read-write mode
+    rpc SetReadWrite(SetReadWriteRequest) returns (SetReadWriteResponse) {};
+    // StartReplication will run the underlying database command to start replication on a tablet
+    rpc StartReplication(StartReplicationRequest) returns (StartReplicationResponse) {};
+    // StopReplication will run th underlying database command to stop replication on a tablet
+    rpc StopReplication(StopReplicationRequest) returns (StopReplicationResponse) {};
+    // ValidateKeyspace validates that all nodes reachable from the specified keyspace are consistent.
+    rpc ValidateKeyspace(ValidateKeyspaceRequest) returns (vtctldata.ValidateKeyspaceResponse) {};
+    // ValidateSchemaKeyspace validates that the schema on the primary tablet for shard 0 matches the schema on all of the other tablets in the keyspace
+    rpc ValidateSchemaKeyspace(ValidateSchemaKeyspaceRequest) returns (vtctldata.ValidateSchemaKeyspaceResponse) {};
+	// ValidateVersionKeyspace validates that the version on the primary of shard 0 matches all of the other tablets in the keyspace.
+    rpc ValidateVersionKeyspace(ValidateVersionKeyspaceRequest) returns (vtctldata.ValidateVersionKeyspaceResponse) {};
+    // VTExplain provides information on how Vitess plans to execute a particular query.
+    rpc VTExplain(VTExplainRequest) returns (VTExplainResponse) {};
+}
+
+/* Data types */
+
+// Cluster represents information about a Vitess cluster.
+message Cluster {
+    string id = 1;
+    string name = 2;
+}
+
+message ClusterBackup {
+    Cluster cluster = 1;
+    mysqlctl.BackupInfo backup = 2;
+}
+
+message ClusterShardReplicationPosition {
+    Cluster cluster = 1;
+    string keyspace = 2;
+    string shard = 3;
+    vtctldata.ShardReplicationPositionsResponse position_info = 4;
+}
+
+message ClusterWorkflows {
+    repeated Workflow workflows = 1;
+    // Warnings is a list of non-fatal errors encountered when fetching
+    // workflows for a particular cluster.
+    repeated string warnings = 2;
+}
+
+// Keyspace represents information about a keyspace in a particular Vitess
+// cluster.
+message Keyspace {
+    Cluster cluster = 1;
+    vtctldata.Keyspace keyspace = 2;
+    map<string, vtctldata.Shard> shards = 3;
+}
+
+message Schema {
+    Cluster cluster = 1;
+    string keyspace = 2;
+
+    repeated tabletmanagerdata.TableDefinition table_definitions = 3;
+    // TableSizes is a mapping of table name to TableSize information.
+    map<string, TableSize> table_sizes = 4;
+
+    message ShardTableSize {
+        uint64 row_count = 1;
+        uint64 data_length = 2;
+    }
+
+    // TableSize aggregates table size information across all shards containing
+    // in the given keyspace and cluster, as well as per-shard size information.
+    message TableSize {
+        uint64 row_count = 1;
+        uint64 data_length = 2;
+        map<string, ShardTableSize> by_shard = 3;
+    }
+}
+
+message SrvVSchema {
+    string cell = 1;
+    Cluster cluster = 2;
+    vschema.SrvVSchema srv_v_schema = 3;
+}
+
+// Tablet groups the topo information of a tablet together with the Vitess
+// cluster it belongs to.
+message Tablet {
+    Cluster cluster = 1;
+    topodata.Tablet tablet = 2;
+
+    enum ServingState {
+        UNKNOWN = 0;
+        SERVING = 1;
+        NOT_SERVING = 2;
+    }
+
+    ServingState state = 3;
+    string FQDN = 4;
+}
+
+// VSchema represents the vschema for a keyspace in the cluster it belongs to.
+message VSchema {
+    Cluster cluster = 1;
+    // Name is the name of the keyspace this VSchema is for.
+    string name = 2;
+    vschema.Keyspace v_schema = 3;
+}
+
+// Vtctld represents information about a single Vtctld host.
+message Vtctld {
+    string hostname = 1;
+    Cluster cluster = 2;
+    string FQDN = 3;
+}
+
+// VTGate represents information about a single VTGate host.
+message VTGate {
+    // Hostname is the shortname of the VTGate.
+    string hostname = 1;
+    // Pool is group the VTGate serves queries for. Some deployments segment
+    // VTGates into groups or pools, based on the workloads they serve queries
+    // for. Use of this field is optional.
+    string pool = 2;
+    // Cell is the topology cell the VTGate is in.
+    string cell = 3;
+    // Cluster is the cluster the VTGate serves.
+    Cluster cluster = 4;
+    // Keyspaces is the list of keyspaces-to-watch for the VTGate.
+    repeated string keyspaces = 5;
+    string FQDN = 6;
+}
+
+message Workflow {
+    Cluster cluster = 1;
+    string keyspace = 2;
+    vtctldata.Workflow workflow = 3;
+}
+
+/* Request/Response types */
+
+message CreateKeyspaceRequest {
+    string cluster_id = 1;
+    vtctldata.CreateKeyspaceRequest options = 2;
+}
+
+message CreateKeyspaceResponse {
+    Keyspace keyspace = 1;
+}
+
+message CreateShardRequest {
+    string cluster_id = 1;
+    vtctldata.CreateShardRequest options = 2;
+}
+
+message DeleteKeyspaceRequest {
+    string cluster_id = 1;
+    vtctldata.DeleteKeyspaceRequest options = 2;
+}
+
+message DeleteShardsRequest {
+    string cluster_id = 1;
+    vtctldata.DeleteShardsRequest options = 2;
+}
+
+message DeleteTabletRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message DeleteTabletResponse {
+    string status = 1;
+}
+
+message FindSchemaRequest {
+    string table = 1;
+    repeated string cluster_ids = 2;
+    GetSchemaTableSizeOptions table_size_options = 3;
+}
+
+message GetBackupsRequest {
+    repeated string cluster_ids = 1;
+    // Keyspaces, if set, limits backups to just the specified keyspaces.
+    // Applies to all clusters in the request.
+    repeated string keyspaces = 2;
+    // KeyspaceShards, if set, limits backups to just the specified
+    // keyspace/shards. Applies to all clusters in the request.
+    //
+    // This field takes precedence over Keyspaces. If KeyspaceShards is set,
+    // Keyspaces is ignored.
+    repeated string keyspace_shards = 3;
+    // RequestOptions controls the per-shard request options when making
+    // GetBackups requests to vtctlds. Note that the Keyspace and Shard fields
+    // of this field are ignored; it is used only to specify Limit and Detailed
+    // fields.
+    vtctldata.GetBackupsRequest request_options = 4;
+}
+
+message GetBackupsResponse {
+    repeated ClusterBackup backups = 1;
+}
+
+message GetClustersRequest {}
+
+message GetClustersResponse {
+    repeated Cluster clusters = 1;
+}
+
+message GetGatesRequest {
+    repeated string cluster_ids = 1;
+}
+
+message GetGatesResponse {
+    repeated VTGate gates = 1;
+}
+
+message GetKeyspaceRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+}
+
+message GetKeyspacesRequest {
+    repeated string cluster_ids = 1;
+}
+
+message GetKeyspacesResponse {
+    repeated Keyspace keyspaces = 1;
+}
+
+message GetSchemaRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+    string table = 3;
+    GetSchemaTableSizeOptions table_size_options = 4;
+}
+
+message GetSchemasRequest {
+    repeated string cluster_ids = 1;
+    GetSchemaTableSizeOptions table_size_options = 2;
+}
+
+message GetSchemasResponse {
+    repeated Schema schemas = 1;
+}
+
+message GetShardReplicationPositionsRequest {
+    repeated string cluster_ids = 1;
+    // Keyspaces, if set, limits replication positions to just the specified
+    // keyspaces. Applies to all clusters in the request.
+    repeated string keyspaces = 2;
+    // KeyspaceShards, if set, limits replicatin positions to just the specified
+    // keyspace/shards. Applies to all clusters in the request.
+    //
+    // This field takes precedence over Keyspaces. If KeyspaceShards is set,
+    // Keyspaces is ignored.
+    repeated string keyspace_shards = 3;
+}
+
+message GetShardReplicationPositionsResponse {
+    repeated ClusterShardReplicationPosition replication_positions = 1;
+}
+
+message GetSrvVSchemaRequest {
+    string cluster_id = 1;
+    string cell = 2;
+}
+
+message GetSrvVSchemasRequest {
+    repeated string cluster_ids = 1;
+    repeated string cells = 2;
+}
+
+message GetSrvVSchemasResponse {
+    repeated SrvVSchema srv_v_schemas = 1;
+}
+
+message GetSchemaTableSizeOptions {
+    bool aggregate_sizes = 1;
+    bool include_non_serving_shards = 2;
+}
+
+message GetTabletRequest {
+    // Unique (per cluster) tablet alias of the standard form: "$cell-$uid"
+    string alias = 1;
+    // ClusterIDs is an optional parameter to narrow the scope of the search, if
+    // the caller knows which cluster the tablet may be in, or, to disamiguate if
+    // multiple clusters have a tablet with the same hostname.
+    repeated string cluster_ids = 2;
+}
+
+message GetTabletsRequest {
+    repeated string cluster_ids = 1;
+}
+
+message GetTabletsResponse {
+    repeated Tablet tablets = 1;
+}
+
+message GetVSchemaRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+}
+
+message GetVSchemasRequest {
+    repeated string cluster_ids = 1;
+}
+
+message GetVSchemasResponse {
+    repeated VSchema v_schemas = 1;
+}
+
+message GetVtctldsRequest {
+    repeated string cluster_ids = 1;
+}
+
+message GetVtctldsResponse {
+    repeated Vtctld vtctlds = 1;
+}
+
+message GetWorkflowRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+    string name = 3;
+    bool active_only = 4;
+}
+
+message GetWorkflowsRequest {
+    repeated string cluster_ids = 1;
+    // ActiveOnly specifies whether to return workflows that are currently
+    // active (running or paused) instead of all workflows.
+    bool active_only = 2;
+    // Keyspaces is a list of keyspaces to restrict the workflow search to. Note
+    // that the keyspaces list applies across all cluster IDs in the request.
+    //
+    // If, for example, you have two clusters, each with a keyspace called "foo"
+    // and want the workflows from "foo" in cluster1 but not from cluster2, you
+    // must make two requests.
+    //
+    // Keyspaces and IgnoreKeyspaces are mutually-exclusive, and Keyspaces takes
+    // precedence; if Keyspaces is a non-empty list, then IgnoreKeyspaces is
+    // ignored completely.
+    repeated string keyspaces = 3;
+    // IgnoreKeyspaces is a list of keyspaces to skip during the workflow
+    // search. It has the same semantics as the Keyspaces parameter, so refer to
+    // that documentation for more details.
+    repeated string ignore_keyspaces = 4;
+}
+
+message GetWorkflowsResponse {
+    map <string, ClusterWorkflows> workflows_by_cluster = 1;
+}
+
+message PingTabletRequest {
+    // Unique (per cluster) tablet alias of the standard form: "$cell-$uid"
+    string alias = 1;
+    // ClusterIDs is an optional parameter to narrow the scope of the search, if
+    // the caller knows which cluster the tablet may be in, or, to disamiguate if
+    // multiple clusters have a tablet with the same hostname.
+    repeated string cluster_ids = 2;
+}
+
+message PingTabletResponse {
+    string status = 1;
+}
+
+message RefreshStateRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message RefreshStateResponse {
+    string status = 1;
+}
+
+message ReparentTabletRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message ReparentTabletResponse {
+    string keyspace = 1;
+    string shard = 2;
+    string primary = 3;
+}
+
+message RunHealthCheckRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message RunHealthCheckResponse {
+    string status = 1;
+}
+
+message SetReadOnlyRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message SetReadOnlyResponse {
+
+}
+
+message SetReadWriteRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message SetReadWriteResponse {
+    
+}
+
+message StartReplicationRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message StartReplicationResponse {
+    string status = 1;
+}
+
+message StopReplicationRequest {
+    string alias = 1;
+    repeated string cluster_ids = 2;
+}
+
+message StopReplicationResponse {
+    string status = 1;
+}
+
+message ValidateKeyspaceRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+    bool ping_tablets = 3;
+}
+
+message ValidateSchemaKeyspaceRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+}
+
+message ValidateVersionKeyspaceRequest {
+    string cluster_id = 1;
+    string keyspace = 2;
+}
+
+message VTExplainRequest {
+    string cluster = 1;
+    string keyspace = 2;
+    string sql = 3;
+}
+
+message VTExplainResponse {
+    string response = 1;
+}

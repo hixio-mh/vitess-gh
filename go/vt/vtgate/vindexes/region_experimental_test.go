@@ -20,8 +20,11 @@ import (
 	"strconv"
 	"testing"
 
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/key"
 )
@@ -46,7 +49,7 @@ func TestRegionExperimentalMap(t *testing.T) {
 	}, {
 		sqltypes.NewInt64(256), sqltypes.NewInt64(1),
 	}, {
-		// Invalid length.
+		// only region id provided, partial column for key range mapping.
 		sqltypes.NewInt64(1),
 	}, {
 		// Invalid region.
@@ -61,7 +64,7 @@ func TestRegionExperimentalMap(t *testing.T) {
 		key.DestinationKeyspaceID([]byte("\x01\x16k@\xb4J\xbaK\xd6")),
 		key.DestinationKeyspaceID([]byte("\xff\x16k@\xb4J\xbaK\xd6")),
 		key.DestinationKeyspaceID([]byte("\x00\x16k@\xb4J\xbaK\xd6")),
-		key.DestinationNone{},
+		key.DestinationKeyRange{KeyRange: &topodatapb.KeyRange{Start: []byte("\x01"), End: []byte("\x02")}},
 		key.DestinationNone{},
 		key.DestinationNone{},
 	}
