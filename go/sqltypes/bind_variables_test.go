@@ -22,10 +22,8 @@ import (
 	"strings"
 	"testing"
 
-	"vitess.io/vitess/go/test/utils"
-
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
@@ -45,21 +43,21 @@ func TestProtoConversions(t *testing.T) {
 
 func TestBuildBindVariables(t *testing.T) {
 	tcases := []struct {
-		in  map[string]interface{}
+		in  map[string]any
 		out map[string]*querypb.BindVariable
 		err string
 	}{{
 		in:  nil,
 		out: nil,
 	}, {
-		in: map[string]interface{}{
+		in: map[string]any{
 			"k": int64(1),
 		},
 		out: map[string]*querypb.BindVariable{
 			"k": Int64BindVariable(1),
 		},
 	}, {
-		in: map[string]interface{}{
+		in: map[string]any{
 			"k": byte(1),
 		},
 		err: "k: type uint8 not supported as bind var: 1",
@@ -84,13 +82,13 @@ func TestBuildBindVariables(t *testing.T) {
 
 func TestBuildBindVariable(t *testing.T) {
 	tcases := []struct {
-		in  interface{}
+		in  any
 		out *querypb.BindVariable
 		err string
 	}{{
 		in: "aa",
 		out: &querypb.BindVariable{
-			Type:  querypb.Type_VARBINARY,
+			Type:  querypb.Type_VARCHAR,
 			Value: []byte("aa"),
 		},
 	}, {
@@ -154,11 +152,11 @@ func TestBuildBindVariable(t *testing.T) {
 			Value: []byte("1"),
 		},
 	}, {
-		in: []interface{}{"aa", int64(1)},
+		in: []any{"aa", int64(1)},
 		out: &querypb.BindVariable{
 			Type: querypb.Type_TUPLE,
 			Values: []*querypb.Value{{
-				Type:  querypb.Type_VARBINARY,
+				Type:  querypb.Type_VARCHAR,
 				Value: []byte("aa"),
 			}, {
 				Type:  querypb.Type_INT64,
@@ -170,10 +168,10 @@ func TestBuildBindVariable(t *testing.T) {
 		out: &querypb.BindVariable{
 			Type: querypb.Type_TUPLE,
 			Values: []*querypb.Value{{
-				Type:  querypb.Type_VARBINARY,
+				Type:  querypb.Type_VARCHAR,
 				Value: []byte("aa"),
 			}, {
-				Type:  querypb.Type_VARBINARY,
+				Type:  querypb.Type_VARCHAR,
 				Value: []byte("bb"),
 			}},
 		},
@@ -241,7 +239,7 @@ func TestBuildBindVariable(t *testing.T) {
 		in:  byte(1),
 		err: "type uint8 not supported as bind var: 1",
 	}, {
-		in:  []interface{}{1, byte(1)},
+		in:  []any{1, byte(1)},
 		err: "type uint8 not supported as bind var: 1",
 	}}
 	for _, tcase := range tcases {
@@ -250,7 +248,7 @@ func TestBuildBindVariable(t *testing.T) {
 			if tcase.err != "" {
 				require.EqualError(t, err, tcase.err)
 			} else {
-				utils.MustMatch(t, tcase.out, bv, "binvar output did not match")
+				require.Truef(t, proto.Equal(tcase.out, bv), "binvar output did not match")
 			}
 		})
 	}
@@ -587,8 +585,7 @@ func TestBindVariablesFormat(t *testing.T) {
 	if !strings.Contains(formattedStr, "key_3") || !strings.Contains(formattedStr, "val_3") {
 		t.Fatalf("bind variable 'key_3': 'val_3' is not formatted")
 	}
-	if !strings.Contains(formattedStr, "key_4") ||
-		!strings.Contains(formattedStr, "values:<type:INT64 value:\"1\" > values:<type:INT64 value:\"2\" >") {
+	if !strings.Contains(formattedStr, "key_4:type:TUPLE") {
 		t.Fatalf("bind variable 'key_4': (1, 2) is not formatted")
 	}
 
@@ -609,7 +606,7 @@ func TestBindVariablesFormat(t *testing.T) {
 
 	formattedStr = FormatBindVariables(bindVariables, true /* full */, true /* asJSON */)
 	t.Logf("%q", formattedStr)
-	if !strings.Contains(formattedStr, "\"key_1\": {\"type\": \"VARBINARY\", \"value\": \"val_1\"}") {
+	if !strings.Contains(formattedStr, "\"key_1\": {\"type\": \"VARCHAR\", \"value\": \"val_1\"}") {
 		t.Fatalf("bind variable 'key_1' is not formatted")
 	}
 
@@ -626,7 +623,7 @@ func TestBindVariablesFormat(t *testing.T) {
 	}
 
 	formattedStr = FormatBindVariables(bindVariables, false /* full */, true /* asJSON */)
-	if !strings.Contains(formattedStr, "\"key_1\": {\"type\": \"VARBINARY\", \"value\": \"5 bytes\"}") {
+	if !strings.Contains(formattedStr, "\"key_1\": {\"type\": \"VARCHAR\", \"value\": \"5 bytes\"}") {
 		t.Fatalf("bind variable 'key_1' is not formatted")
 	}
 
@@ -634,11 +631,11 @@ func TestBindVariablesFormat(t *testing.T) {
 		t.Fatalf("bind variable 'key_2' is not formatted")
 	}
 
-	if !strings.Contains(formattedStr, "\"key_3\": {\"type\": \"VARBINARY\", \"value\": \"5 bytes\"}") {
+	if !strings.Contains(formattedStr, "\"key_3\": {\"type\": \"VARCHAR\", \"value\": \"5 bytes\"}") {
 		t.Fatalf("bind variable 'key_3' is not formatted")
 	}
 
-	if !strings.Contains(formattedStr, "\"key_4\": {\"type\": \"VARBINARY\", \"value\": \"2 items\"}") {
+	if !strings.Contains(formattedStr, "\"key_4\": {\"type\": \"VARCHAR\", \"value\": \"2 items\"}") {
 		t.Fatalf("bind variable 'key_4' is not formatted")
 	}
 }

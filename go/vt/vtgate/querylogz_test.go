@@ -17,7 +17,7 @@ limitations under the License.
 package vtgate
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -25,7 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/streamlog"
 	"vitess.io/vitess/go/vt/callerid"
 )
@@ -33,7 +34,7 @@ import (
 func TestQuerylogzHandlerInvalidLogStats(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/querylogz?timeout=10&limit=1", nil)
 	response := httptest.NewRecorder()
-	ch := make(chan interface{}, 1)
+	ch := make(chan any, 1)
 	ch <- "test msg"
 	querylogzHandler(ch, response, req)
 	close(ch)
@@ -80,11 +81,11 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 	}
 	logStats.EndTime = logStats.StartTime.Add(1 * time.Millisecond)
 	response := httptest.NewRecorder()
-	ch := make(chan interface{}, 1)
+	ch := make(chan any, 1)
 	ch <- logStats
 	querylogzHandler(ch, response, req)
 	close(ch)
-	body, _ := ioutil.ReadAll(response.Body)
+	body, _ := io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, fastQueryPattern, logStats, body)
 
 	// medium query
@@ -109,11 +110,11 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 	}
 	logStats.EndTime = logStats.StartTime.Add(20 * time.Millisecond)
 	response = httptest.NewRecorder()
-	ch = make(chan interface{}, 1)
+	ch = make(chan any, 1)
 	ch <- logStats
 	querylogzHandler(ch, response, req)
 	close(ch)
-	body, _ = ioutil.ReadAll(response.Body)
+	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, mediumQueryPattern, logStats, body)
 
 	// slow query
@@ -137,21 +138,21 @@ func TestQuerylogzHandlerFormatting(t *testing.T) {
 		`</tr>`,
 	}
 	logStats.EndTime = logStats.StartTime.Add(500 * time.Millisecond)
-	ch = make(chan interface{}, 1)
+	ch = make(chan any, 1)
 	ch <- logStats
 	querylogzHandler(ch, response, req)
 	close(ch)
-	body, _ = ioutil.ReadAll(response.Body)
+	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, slowQueryPattern, logStats, body)
 
 	// ensure querylogz is not affected by the filter tag
 	*streamlog.QueryLogFilterTag = "XXX_SKIP_ME"
 	defer func() { *streamlog.QueryLogFilterTag = "" }()
-	ch = make(chan interface{}, 1)
+	ch = make(chan any, 1)
 	ch <- logStats
 	querylogzHandler(ch, response, req)
 	close(ch)
-	body, _ = ioutil.ReadAll(response.Body)
+	body, _ = io.ReadAll(response.Body)
 	checkQuerylogzHasStats(t, slowQueryPattern, logStats, body)
 
 }

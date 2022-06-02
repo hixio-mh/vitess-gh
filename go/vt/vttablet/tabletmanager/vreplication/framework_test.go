@@ -27,10 +27,15 @@ import (
 	"testing"
 	"time"
 
+	"vitess.io/vitess/go/vt/withddl"
+
+	"vitess.io/vitess/go/vt/log"
+
 	"github.com/stretchr/testify/require"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"context"
+
+	"google.golang.org/protobuf/proto"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/sqltypes"
@@ -65,6 +70,8 @@ type LogExpectation struct {
 	Detail string
 }
 
+var heartbeatRe *regexp.Regexp
+
 func init() {
 	tabletconn.RegisterDialer("test", func(tablet *topodatapb.Tablet, failFast grpcclient.FailFast) (queryservice.QueryService, error) {
 		return &fakeTabletConn{
@@ -76,6 +83,8 @@ func init() {
 
 	binlogplayer.RegisterClientFactory("test", func() binlogplayer.Client { return globalFBC })
 	flag.Set("binlog_player_protocol", "test")
+
+	heartbeatRe = regexp.MustCompile(`update _vt.vreplication set time_updated=\d+ where id=\d+`)
 }
 
 func TestMain(m *testing.M) {
@@ -90,10 +99,12 @@ func TestMain(m *testing.M) {
 		}
 		defer env.Close()
 
+		*vreplicationExperimentalFlags = 0
+
 		// engines cannot be initialized in testenv because it introduces
 		// circular dependencies.
-		streamerEngine = vstreamer.NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine, env.Cells[0])
-		streamerEngine.InitDBConfig(env.KeyspaceName)
+		streamerEngine = vstreamer.NewEngine(env.TabletEnv, env.SrvTopo, env.SchemaEngine, nil, env.Cells[0])
+		streamerEngine.InitDBConfig(env.KeyspaceName, env.ShardName)
 		streamerEngine.Open()
 		defer streamerEngine.Close()
 
@@ -111,16 +122,24 @@ func TestMain(m *testing.M) {
 			"exta": env.Dbcfgs,
 			"extb": env.Dbcfgs,
 		}
-		playerEngine = NewTestEngine(env.TopoServ, env.Cells[0], env.Mysqld, realDBClientFactory, vrepldb, externalConfig)
+		playerEngine = NewTestEngine(env.TopoServ, env.Cells[0], env.Mysqld, realDBClientFactory, realDBClientFactory, vrepldb, externalConfig)
 		playerEngine.Open(context.Background())
 		defer playerEngine.Close()
-
 		if err := env.Mysqld.ExecuteSuperQueryList(context.Background(), binlogplayer.CreateVReplicationTable()); err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
 		}
 
+		for _, query := range binlogplayer.AlterVReplicationTable {
+			env.Mysqld.ExecuteSuperQuery(context.Background(), query)
+		}
+
 		if err := env.Mysqld.ExecuteSuperQuery(context.Background(), createCopyState); err != nil {
+			fmt.Fprintf(os.Stderr, "%v", err)
+			return 1
+		}
+
+		if err := env.Mysqld.ExecuteSuperQuery(context.Background(), createVReplicationLogTable); err != nil {
 			fmt.Fprintf(os.Stderr, "%v", err)
 			return 1
 		}
@@ -134,9 +153,9 @@ func resetBinlogClient() {
 	globalFBC = &fakeBinlogClient{}
 }
 
-func masterPosition(t *testing.T) string {
+func primaryPosition(t *testing.T) string {
 	t.Helper()
-	pos, err := env.Mysqld.MasterPosition()
+	pos, err := env.Mysqld.PrimaryPosition()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +165,7 @@ func masterPosition(t *testing.T) string {
 func execStatements(t *testing.T, queries []string) {
 	t.Helper()
 	if err := env.Mysqld.ExecuteSuperQueryList(context.Background(), queries); err != nil {
+		log.Errorf("Error executing query: %s", err.Error())
 		t.Error(err)
 	}
 }
@@ -170,6 +190,7 @@ func addTablet(id int) *topodatapb.Tablet {
 	if err := env.TopoServ.CreateTablet(context.Background(), tablet); err != nil {
 		panic(err)
 	}
+	env.SchemaEngine.Reload(context.Background())
 	return tablet
 }
 
@@ -190,6 +211,7 @@ func addOtherTablet(id int, keyspace, shard string) *topodatapb.Tablet {
 	if err := env.TopoServ.CreateTablet(context.Background(), tablet); err != nil {
 		panic(err)
 	}
+	env.SchemaEngine.Reload(context.Background())
 	return tablet
 }
 
@@ -197,6 +219,7 @@ func deleteTablet(tablet *topodatapb.Tablet) {
 	env.TopoServ.DeleteTablet(context.Background(), tablet.Alias)
 	// This is not automatically removed from shard replication, which results in log spam.
 	topo.DeleteTabletReplicationData(context.Background(), env.TopoServ, tablet)
+	env.SchemaEngine.Reload(context.Background())
 }
 
 // fakeTabletConn implement TabletConn interface. We only care about the
@@ -389,7 +412,8 @@ func (dbc *realDBClient) Close() {
 }
 
 func (dbc *realDBClient) ExecuteFetch(query string, maxrows int) (*sqltypes.Result, error) {
-	if strings.HasPrefix(query, "use") {
+	if strings.HasPrefix(query, "use") ||
+		query == withddl.QueryToTriggerWithDDL { // this query breaks unit tests since it errors out
 		return nil, nil
 	}
 	qr, err := dbc.conn.ExecuteFetch(query, 10000, true)
@@ -406,15 +430,13 @@ func (dbc *realDBClient) ExecuteFetch(query string, maxrows int) (*sqltypes.Resu
 
 func expectDeleteQueries(t *testing.T) {
 	t.Helper()
-	expectDBClientQueries(t, []string{
-		"begin",
+	expectNontxQueries(t, []string{
 		"/delete from _vt.vreplication",
 		"/delete from _vt.copy_state",
-		"commit",
 	})
 }
 
-func expectLogsAndUnsubscribe(t *testing.T, logs []LogExpectation, logCh chan interface{}) {
+func expectLogsAndUnsubscribe(t *testing.T, logs []LogExpectation, logCh chan any) {
 	t.Helper()
 	defer vrLogStatsLogger.Unsubscribe(logCh)
 	failed := false
@@ -453,37 +475,70 @@ func expectLogsAndUnsubscribe(t *testing.T, logs []LogExpectation, logCh chan in
 	}
 }
 
-func expectDBClientQueries(t *testing.T, queries []string) {
+func shouldIgnoreQuery(query string) bool {
+	queriesToIgnore := []string{
+		"_vt.vreplication_log", // ignore all selects, updates and inserts into this table
+		"@@session.sql_mode",   // ignore all selects, and sets of this variable
+		", time_heartbeat=",    // update of last heartbeat time, can happen out-of-band, so can't test for it
+		"context cancel",
+	}
+	for _, q := range queriesToIgnore {
+		if strings.Contains(query, q) {
+			return true
+		}
+	}
+	return heartbeatRe.MatchString(query)
+}
+
+func expectDBClientQueries(t *testing.T, queries []string, skippableOnce ...string) {
+	extraQueries := withDDL.DDLs()
+	extraQueries = append(extraQueries, withDDLInitialQueries...)
+	// Either 'queries' or 'queriesWithDDLs' must match globalDBQueries
 	t.Helper()
 	failed := false
+	skippedOnce := false
+
+	queryMatch := func(query string, got string) bool {
+		if query[0] == '/' {
+			result, err := regexp.MatchString(query[1:], got)
+			if err != nil {
+				panic(err)
+			}
+			return result
+		}
+		return (got == query)
+	}
 	for i, query := range queries {
 		if failed {
 			t.Errorf("no query received, expecting %s", query)
 			continue
 		}
 		var got string
-		heartbeatRe := regexp.MustCompile(`update _vt.vreplication set time_updated=\d+, transaction_timestamp=\d+ where id=\d+`)
 	retry:
 		select {
 		case got = <-globalDBQueries:
 			// We rule out heartbeat time update queries because otherwise our query list
 			// is indeterminable and varies with each test execution.
-			if heartbeatRe.MatchString(got) {
+			if shouldIgnoreQuery(got) {
 				goto retry
 			}
-
-			var match bool
-			if query[0] == '/' {
-				result, err := regexp.MatchString(query[1:], got)
-				if err != nil {
-					panic(err)
+			for _, extraQuery := range extraQueries {
+				if got == extraQuery {
+					goto retry
 				}
-				match = result
-			} else {
-				match = (got == query)
 			}
-			if !match {
-				t.Errorf("query:\n%q, does not match query %d:\n%q", got, i, query)
+
+			if !queryMatch(query, got) {
+				if !skippedOnce {
+					// let's see if "got" is a skippable query
+					for _, skippable := range skippableOnce {
+						if queryMatch(skippable, got) {
+							skippedOnce = true
+							goto retry
+						}
+					}
+				}
+				t.Errorf("query:\n%q, does not match expected query %d:\n%q", got, i, query)
 			}
 		case <-time.After(5 * time.Second):
 			t.Errorf("no query received, expecting %s", query)
@@ -493,6 +548,9 @@ func expectDBClientQueries(t *testing.T, queries []string) {
 	for {
 		select {
 		case got := <-globalDBQueries:
+			if shouldIgnoreQuery(got) {
+				continue
+			}
 			t.Errorf("unexpected query: %s", got)
 		default:
 			return
@@ -505,7 +563,9 @@ func expectDBClientQueries(t *testing.T, queries []string) {
 func expectNontxQueries(t *testing.T, queries []string) {
 	t.Helper()
 	failed := false
-	heartbeatRe := regexp.MustCompile(`update _vt.vreplication set time_updated=\d+, transaction_timestamp=\d+ where id=\d+`)
+
+	skipQueries := withDDLInitialQueries
+	skipQueries = append(skipQueries, withDDL.DDLs()...)
 	for i, query := range queries {
 		if failed {
 			t.Errorf("no query received, expecting %s", query)
@@ -515,9 +575,14 @@ func expectNontxQueries(t *testing.T, queries []string) {
 	retry:
 		select {
 		case got = <-globalDBQueries:
-
-			if got == "begin" || got == "commit" || got == "rollback" || strings.Contains(got, "update _vt.vreplication set pos") || heartbeatRe.MatchString(got) {
+			if got == "begin" || got == "commit" || got == "rollback" || strings.Contains(got, "update _vt.vreplication set pos") ||
+				shouldIgnoreQuery(got) {
 				goto retry
+			}
+			for _, skipQuery := range skipQueries {
+				if got == skipQuery {
+					goto retry
+				}
 			}
 
 			var match bool
@@ -530,11 +595,9 @@ func expectNontxQueries(t *testing.T, queries []string) {
 			} else {
 				match = (got == query)
 			}
-			if !match {
-				t.Errorf("query:\n%q, does not match query %d:\n%q", got, i, query)
-			}
+			require.True(t, match, "query %d:: got:%s, want:%s", i, got, query)
 		case <-time.After(5 * time.Second):
-			t.Errorf("no query received, expecting %s", query)
+			t.Fatalf("no query received, expecting %s", query)
 			failed = true
 		}
 	}
@@ -542,6 +605,9 @@ func expectNontxQueries(t *testing.T, queries []string) {
 		select {
 		case got := <-globalDBQueries:
 			if got == "begin" || got == "commit" || got == "rollback" || strings.Contains(got, "_vt.vreplication") {
+				continue
+			}
+			if shouldIgnoreQuery(got) {
 				continue
 			}
 			t.Errorf("unexpected query: %s", got)
@@ -555,6 +621,14 @@ func expectData(t *testing.T, table string, values [][]string) {
 	customExpectData(t, table, values, env.Mysqld.FetchSuperQuery)
 }
 
+func expectQueryResult(t *testing.T, query string, values [][]string) {
+	t.Helper()
+	err := compareQueryResults(t, query, values, env.Mysqld.FetchSuperQuery)
+	if err != nil {
+		require.FailNow(t, "data mismatch", err)
+	}
+}
+
 func customExpectData(t *testing.T, table string, values [][]string, exec func(ctx context.Context, query string) (*sqltypes.Result, error)) {
 	t.Helper()
 
@@ -564,24 +638,35 @@ func customExpectData(t *testing.T, table string, values [][]string, exec func(c
 	} else {
 		query = fmt.Sprintf("select * from %s", table)
 	}
+	err := compareQueryResults(t, query, values, exec)
+	if err != nil {
+		require.FailNow(t, "data mismatch", err)
+	}
+}
+
+func compareQueryResults(t *testing.T, query string, values [][]string,
+	exec func(ctx context.Context, query string) (*sqltypes.Result, error)) error {
+
+	t.Helper()
 	qr, err := exec(context.Background(), query)
 	if err != nil {
-		t.Error(err)
-		return
+		return err
 	}
 	if len(values) != len(qr.Rows) {
-		t.Fatalf("row counts don't match: %v, want %v", qr.Rows, values)
+		return fmt.Errorf("row counts don't match: %v, want %v", qr.Rows, values)
 	}
 	for i, row := range values {
 		if len(row) != len(qr.Rows[i]) {
-			t.Fatalf("Too few columns, result: %v, row: %d, want: %v", qr.Rows[i], i, row)
+			return fmt.Errorf("Too few columns, \nrow: %d, \nresult: %d:%v, \nwant: %d:%v", i, len(qr.Rows[i]), qr.Rows[i], len(row), row)
 		}
 		for j, val := range row {
 			if got := qr.Rows[i][j].ToString(); got != val {
-				t.Errorf("Mismatch at (%d, %d): %v, want %s", i, j, qr.Rows[i][j], val)
+				return fmt.Errorf("Mismatch at (%d, %d): %v, want %s", i, j, qr.Rows[i][j], val)
 			}
 		}
 	}
+
+	return nil
 }
 
 func validateQueryCountStat(t *testing.T, phase string, want int64) {

@@ -20,7 +20,7 @@ package worker
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
 	"os/exec"
@@ -30,25 +30,26 @@ import (
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/test/endtoend/sharding"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"vitess.io/vitess/go/json2"
 	"vitess.io/vitess/go/test/endtoend/cluster"
+	"vitess.io/vitess/go/test/endtoend/sharding"
+
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
 var (
-	master   *cluster.Vttablet
+	primary  *cluster.Vttablet
 	replica1 *cluster.Vttablet
 	rdOnly1  *cluster.Vttablet
 
-	shard0Master  *cluster.Vttablet
+	shard0Primary *cluster.Vttablet
 	shard0Replica *cluster.Vttablet
 	shard0RdOnly1 *cluster.Vttablet
 
-	shard1Master  *cluster.Vttablet
+	shard1Primary *cluster.Vttablet
 	shard1Replica *cluster.Vttablet
 	shard1RdOnly1 *cluster.Vttablet
 
@@ -62,7 +63,7 @@ var (
 	shard1Tablets    []*cluster.Vttablet
 	workerTestOffset = 0
 	commonTabletArg  = []string{
-		"-binlog_use_v3_resharding_mode=true"}
+		"--binlog_use_v3_resharding_mode=true"}
 	vtWorkerTest = `
 	create table worker_test (
 	id bigint unsigned,
@@ -150,7 +151,7 @@ func TestWebInterface(t *testing.T) {
 		resp, err = http.Get(baseURL + "/status")
 		assert.Nil(t, err)
 		if resp.StatusCode == 200 {
-			respByte, _ := ioutil.ReadAll(resp.Body)
+			respByte, _ := io.ReadAll(resp.Body)
 			respStr := string(respByte)
 			assert.Contains(t, respStr, "Ping command was called with message: 'pong'", fmt.Sprintf("Command did not log output to /status: %s", respStr))
 		}
@@ -161,7 +162,7 @@ func TestWebInterface(t *testing.T) {
 		resp, err = http.Get(baseURL + "/status")
 		assert.Nil(t, err)
 		if resp.StatusCode == 200 {
-			respByte, _ := ioutil.ReadAll(resp.Body)
+			respByte, _ := io.ReadAll(resp.Body)
 			statusAfterReset := string(respByte)
 			assert.Contains(t, statusAfterReset, "This worker is idle.", "/status does not indicate that the reset was successful")
 		}
@@ -182,11 +183,11 @@ func initialSetup(t *testing.T) {
 	runShardTablets(t, "80-", shard1Tablets, false)
 
 	// insert values
-	insertValues(master, "shard-0", 1, 4000, 0)
-	insertValues(master, "shard-1", 4, 4000, 1)
+	insertValues(primary, "shard-0", 1, 4000, 0)
+	insertValues(primary, "shard-1", 4, 4000, 1)
 
 	// wait for replication position
-	cluster.WaitForReplicationPos(t, master, rdOnly1, "localhost", 60)
+	cluster.WaitForReplicationPos(t, primary, rdOnly1, "localhost", 60)
 
 	copySchemaToDestinationShard(t)
 }
@@ -197,7 +198,7 @@ func verifySuccessfulWorkerCopyWithReparent(t *testing.T, isMysqlDown bool) {
 
 	// Order of operations:
 	// 1. Run a background vtworker
-	// 2. Wait until the worker successfully resolves the destination masters.
+	// 2. Wait until the worker successfully resolves the destination primaries.
 	// 3. Reparent the destination tablets
 	// 4. Wait until the vtworker copy is finished
 	// 5. Verify that the worker was forced to reresolve topology and retry writes
@@ -243,7 +244,7 @@ func verifySuccessfulWorkerCopyWithReparent(t *testing.T, isMysqlDown bool) {
 		// Stop MySql
 		var mysqlCtlProcessList []*exec.Cmd
 
-		for _, tablet := range []*cluster.Vttablet{shard0Master, shard1Master} {
+		for _, tablet := range []*cluster.Vttablet{shard0Primary, shard1Primary} {
 			tablet.MysqlctlProcess.InitMysql = false
 			sqlProc, err := tablet.MysqlctlProcess.StopProcess()
 			assert.Nil(t, err)
@@ -260,18 +261,18 @@ func verifySuccessfulWorkerCopyWithReparent(t *testing.T, isMysqlDown bool) {
 		// If MySQL is down, we wait until vtworker retried at least once to make
 		// sure it reached the point where a write failed due to MySQL being down.
 		// There should be two retries at least, one for each destination shard.
-		pollForVarsWorkerRetryCount(t, 1)
+		pollForVarsWorkerRetryCount(t, 2)
 
-		// Bring back masters. Since we test with semi-sync now, we need at least
-		// one replica for the new master. This test is already quite expensive,
-		// so we bring back the old master and then let it be converted to a
-		// replica by PRS, rather than leaving the old master down and having a
+		// Bring back primaries. Since we test with semi-sync now, we need at least
+		// one replica for the new primary. This test is already quite expensive,
+		// so we bring back the old primary and then let it be converted to a
+		// replica by PRS, rather than leaving the old primary down and having a
 		// third replica up the whole time.
 
 		// start mysql
 		var mysqlCtlProcessStartList []*exec.Cmd
 
-		for _, tablet := range []*cluster.Vttablet{shard0Master, shard1Master} {
+		for _, tablet := range []*cluster.Vttablet{shard0Primary, shard1Primary} {
 			tablet.MysqlctlProcess.InitMysql = false
 			sqlProc, err := tablet.MysqlctlProcess.StartProcess()
 			assert.Nil(t, err)
@@ -296,18 +297,17 @@ func verifySuccessfulWorkerCopyWithReparent(t *testing.T, isMysqlDown bool) {
 		// down).
 		// You should choose a value for num_insert_rows, such that this test
 		// passes for your environment (trial-and-error...)
-		// Make sure that vtworker got past the point where it picked a master
+		// Make sure that vtworker got past the point where it picked a primary
 		// for each destination shard ("finding targets" state).
 		pollForVars(t, "cloning the data (online)")
 
 	}
 
-	// Reparent away from the old masters.
-	localCluster.VtctlclientProcess.ExecuteCommand("PlannedReparentShard", "-keyspace_shard",
-		"test_keyspace/-80", "-new_master", shard0Replica.Alias)
-
-	localCluster.VtctlclientProcess.ExecuteCommand("PlannedReparentShard", "-keyspace_shard",
-		"test_keyspace/80-", "-new_master", shard1Replica.Alias)
+	// Reparent away from the old primaries.
+	localCluster.VtctlclientProcess.ExecuteCommand("PlannedReparentShard", "--", "--keyspace_shard",
+		"test_keyspace/-80", "--new_primary", shard0Replica.Alias)
+	localCluster.VtctlclientProcess.ExecuteCommand("PlannedReparentShard", "--", "--keyspace_shard",
+		"test_keyspace/80-", "--new_primary", shard1Replica.Alias)
 
 	proc.Wait()
 
@@ -320,9 +320,9 @@ func verifySuccessfulWorkerCopyWithReparent(t *testing.T, isMysqlDown bool) {
 	cluster.WaitForReplicationPos(t, shard0Replica, shard0RdOnly1, "localhost", 60)
 	cluster.WaitForReplicationPos(t, shard1Replica, shard1RdOnly1, "localhost", 60)
 
-	err = localCluster.VtworkerProcess.ExecuteVtworkerCommand(localCluster.GetAndReservePort(), localCluster.GetAndReservePort(), "-cell", cell,
+	err = localCluster.VtworkerProcess.ExecuteVtworkerCommand(localCluster.GetAndReservePort(), localCluster.GetAndReservePort(), "--cell", cell,
 		"--use_v3_resharding_mode=true",
-		"SplitClone",
+		"SplitClone", "--",
 		"--online=false",
 		"--min_healthy_rdonly_tablets", "1",
 		"test_keyspace/0")
@@ -331,8 +331,8 @@ func verifySuccessfulWorkerCopyWithReparent(t *testing.T, isMysqlDown bool) {
 	// Make sure that everything is caught up to the same replication point
 	runSplitDiff(t, "test_keyspace/-80")
 	runSplitDiff(t, "test_keyspace/80-")
-	assertShardDataEqual(t, "0", master, shard0Replica)
-	assertShardDataEqual(t, "1", master, shard1Replica)
+	assertShardDataEqual(t, "0", primary, shard0Replica)
+	assertShardDataEqual(t, "1", primary, shard1Replica)
 }
 
 func assertShardDataEqual(t *testing.T, shardNum string, sourceTablet *cluster.Vttablet, destinationTablet *cluster.Vttablet) {
@@ -352,7 +352,7 @@ func assertShardDataEqual(t *testing.T, shardNum string, sourceTablet *cluster.V
 	countQuery := "select count(*) from worker_test"
 	qrDestinationCount, err := destinationTablet.VttabletProcess.QueryTablet(countQuery, keyspaceName, true)
 	assert.Nil(t, err)
-	assert.Equal(t, fmt.Sprintf("%d", len(qrDestination.Rows)), fmt.Sprintf("%s", qrDestinationCount.Rows[0][0].ToBytes()))
+	assert.Equal(t, fmt.Sprintf("%d", len(qrDestination.Rows)), qrDestinationCount.Rows[0][0].ToString())
 
 }
 
@@ -361,9 +361,9 @@ func runSplitDiff(t *testing.T, keyspaceShard string) {
 
 	err := localCluster.VtworkerProcess.ExecuteVtworkerCommand(localCluster.GetAndReservePort(),
 		localCluster.GetAndReservePort(),
-		"-cell", cell,
+		"--cell", cell,
 		"--use_v3_resharding_mode=true",
-		"SplitDiff",
+		"SplitDiff", "--",
 		"--min_healthy_rdonly_tablets", "1",
 		keyspaceShard)
 	assert.Nil(t, err)
@@ -372,7 +372,7 @@ func runSplitDiff(t *testing.T, keyspaceShard string) {
 
 func pollForVars(t *testing.T, mssg string) {
 	startTime := time.Now()
-	var resultMap map[string]interface{}
+	var resultMap map[string]any
 	var err error
 	var workerState string
 	for {
@@ -389,7 +389,7 @@ func pollForVars(t *testing.T, mssg string) {
 
 func pollForVarsWorkerRetryCount(t *testing.T, count int) {
 	startTime := time.Now()
-	var resultMap map[string]interface{}
+	var resultMap map[string]any
 	var err error
 	var workerRetryCountInt int
 	for {
@@ -405,7 +405,7 @@ func pollForVarsWorkerRetryCount(t *testing.T, count int) {
 		}
 		continue
 	}
-	assert.Greater(t, workerRetryCountInt, count)
+	assert.GreaterOrEqual(t, workerRetryCountInt, count)
 }
 
 // vttablet: the Tablet instance to modify.
@@ -460,7 +460,7 @@ func runShardTablets(t *testing.T, shardName string, tabletArr []*cluster.Vttabl
 	// 1. (optional) Create db
 	// 2. Starting vttablets and let themselves init them
 	// 3. Waiting for the appropriate vttablet state
-	// 4. Force reparent to the master tablet
+	// 4. Force reparent to the primary tablet
 	// 5. RebuildKeyspaceGraph
 	// 7. (optional) Running initial schema setup
 
@@ -473,8 +473,8 @@ func runShardTablets(t *testing.T, shardName string, tabletArr []*cluster.Vttabl
 		require.Nil(t, err)
 	}
 
-	// Reparent to choose an initial master and enable replication.
-	err := localCluster.VtctlclientProcess.InitShardMaster(keyspaceName, shardName, cell, tabletArr[0].TabletUID)
+	// Reparent to choose an initial primary and enable replication.
+	err := localCluster.VtctlclientProcess.InitShardPrimary(keyspaceName, shardName, cell, tabletArr[0].TabletUID)
 	require.Nil(t, err)
 
 	for {
@@ -485,7 +485,7 @@ func runShardTablets(t *testing.T, shardName string, tabletArr []*cluster.Vttabl
 		err = json2.Unmarshal([]byte(result), &shardInfo)
 		assert.Nil(t, err)
 
-		if int(shardInfo.MasterAlias.Uid) == tabletArr[0].TabletUID {
+		if int(shardInfo.PrimaryAlias.Uid) == tabletArr[0].TabletUID {
 			break
 		}
 		time.Sleep(10 * time.Second)
@@ -508,7 +508,7 @@ func runShardTablets(t *testing.T, shardName string, tabletArr []*cluster.Vttabl
 	// set a replica or rdonly tablet back to NOT_SERVING.
 
 	for _, tablet := range tabletArr {
-		err = tablet.VttabletProcess.WaitForTabletType("SERVING")
+		err = tablet.VttabletProcess.WaitForTabletStatus("SERVING")
 		require.Nil(t, err)
 	}
 
@@ -525,7 +525,7 @@ func runShardTablets(t *testing.T, shardName string, tabletArr []*cluster.Vttabl
 
 func copySchemaToDestinationShard(t *testing.T) {
 	for _, keyspaceShard := range []string{"test_keyspace/-80", "test_keyspace/80-"} {
-		err := localCluster.VtctlclientProcess.ExecuteCommand("CopySchemaShard", "--exclude_tables", "unrelated", "test_keyspace/0", keyspaceShard)
+		err := localCluster.VtctlclientProcess.ExecuteCommand("CopySchemaShard", "--", "--exclude_tables", "unrelated", "test_keyspace/0", keyspaceShard)
 		assert.Nil(t, err)
 	}
 }
@@ -560,23 +560,23 @@ func initializeCluster(t *testing.T, onlyTopo bool) (int, error) {
 	}
 
 	// Defining all the tablets
-	master = localCluster.NewVttabletInstance("replica", 0, "")
+	primary = localCluster.NewVttabletInstance("replica", 0, "")
 	replica1 = localCluster.NewVttabletInstance("replica", 0, "")
 	rdOnly1 = localCluster.NewVttabletInstance("rdonly", 0, "")
-	shard0Master = localCluster.NewVttabletInstance("replica", 0, "")
+	shard0Primary = localCluster.NewVttabletInstance("replica", 0, "")
 	shard0Replica = localCluster.NewVttabletInstance("replica", 0, "")
 	shard0RdOnly1 = localCluster.NewVttabletInstance("rdonly", 0, "")
-	shard1Master = localCluster.NewVttabletInstance("replica", 0, "")
+	shard1Primary = localCluster.NewVttabletInstance("replica", 0, "")
 	shard1Replica = localCluster.NewVttabletInstance("replica", 0, "")
 	shard1RdOnly1 = localCluster.NewVttabletInstance("rdonly", 0, "")
 
-	shard.Vttablets = []*cluster.Vttablet{master, replica1, rdOnly1}
-	shard0.Vttablets = []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly1}
-	shard1.Vttablets = []*cluster.Vttablet{shard1Master, shard1Replica, shard1RdOnly1}
+	shard.Vttablets = []*cluster.Vttablet{primary, replica1, rdOnly1}
+	shard0.Vttablets = []*cluster.Vttablet{shard0Primary, shard0Replica, shard0RdOnly1}
+	shard1.Vttablets = []*cluster.Vttablet{shard1Primary, shard1Replica, shard1RdOnly1}
 
 	localCluster.VtTabletExtraArgs = append(localCluster.VtTabletExtraArgs, commonTabletArg...)
 
-	err = localCluster.LaunchCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
+	err = localCluster.SetupCluster(keyspace, []cluster.Shard{*shard, *shard0, *shard1})
 	assert.Nil(t, err)
 
 	// Start MySql
@@ -598,9 +598,9 @@ func initializeCluster(t *testing.T, onlyTopo bool) (int, error) {
 		}
 	}
 
-	shardTablets = []*cluster.Vttablet{master, replica1, rdOnly1}
-	shard0Tablets = []*cluster.Vttablet{shard0Master, shard0Replica, shard0RdOnly1}
-	shard1Tablets = []*cluster.Vttablet{shard1Master, shard1Replica, shard1RdOnly1}
+	shardTablets = []*cluster.Vttablet{primary, replica1, rdOnly1}
+	shard0Tablets = []*cluster.Vttablet{shard0Primary, shard0Replica, shard0RdOnly1}
+	shard1Tablets = []*cluster.Vttablet{shard1Primary, shard1Replica, shard1RdOnly1}
 
 	return 0, nil
 }

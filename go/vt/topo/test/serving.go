@@ -19,8 +19,10 @@ package test
 import (
 	"testing"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+
+	"context"
+
 	"vitess.io/vitess/go/vt/topo"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
@@ -40,7 +42,7 @@ func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
 	srvKeyspace := &topodatapb.SrvKeyspace{
 		Partitions: []*topodatapb.SrvKeyspace_KeyspacePartition{
 			{
-				ServedType: topodatapb.TabletType_MASTER,
+				ServedType: topodatapb.TabletType_PRIMARY,
 				ShardReferences: []*topodatapb.ShardReference{
 					{
 						Name: "-80",
@@ -78,7 +80,7 @@ func checkSrvKeyspace(t *testing.T, ts *topo.Server) {
 		t.Fatalf("UpdateSrvKeyspace(2): %v", err)
 	}
 	if k, err := ts.GetSrvKeyspace(ctx, LocalCellName, "unknown_keyspace_so_far"); err != nil || !proto.Equal(srvKeyspace, k) {
-		t.Errorf("GetSrvKeyspace(out of the blue): %v %v", err, *k)
+		t.Errorf("GetSrvKeyspace(out of the blue): %v %v", err, k)
 	}
 
 	// Delete the SrvKeyspace.

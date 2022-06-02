@@ -1,4 +1,7 @@
-FROM vitess/bootstrap:percona57
+ARG bootstrap_version=8
+ARG image="vitess/bootstrap:${bootstrap_version}-percona57"
+
+FROM "${image}"
 
 # Allows some docker builds to disable CGO
 ARG CGO_ENABLED=0
@@ -16,4 +19,3 @@ RUN make build
 # Fix permissions
 RUN chown -R vitess:vitess /vt
 USER vitess
-

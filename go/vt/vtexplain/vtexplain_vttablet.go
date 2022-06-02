@@ -17,13 +17,15 @@ limitations under the License.
 package vtexplain
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
 	"sync"
 
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/sqlescape"
+	"vitess.io/vitess/go/vt/vttablet/onlineddl"
 
 	"vitess.io/vitess/go/mysql"
 	"vitess.io/vitess/go/mysql/fakesqldb"
@@ -44,16 +46,51 @@ import (
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 )
 
-var (
+type tabletEnv struct {
 	// map of schema introspection queries to their expected results
 	schemaQueries map[string]*sqltypes.Result
 
 	// map for each table from the column name to its type
 	tableColumns map[string]map[string]querypb.Type
+}
 
+func newTabletEnv() *tabletEnv {
+	return &tabletEnv{
+		schemaQueries: make(map[string]*sqltypes.Result),
+		tableColumns:  make(map[string]map[string]querypb.Type),
+	}
+}
+
+func (te *tabletEnv) addResult(query string, result *sqltypes.Result) {
+	te.schemaQueries[query] = result
+}
+
+func (te *tabletEnv) getResult(query string) *sqltypes.Result {
+	result, ok := te.schemaQueries[query]
+	if !ok {
+		return nil
+	}
+	return result
+}
+
+var (
 	// time simulator
-	batchTime *sync2.Batcher
+	batchTime         *sync2.Batcher
+	globalTabletEnv   *tabletEnv
+	globalTabletEnvMu sync.Mutex
 )
+
+func setGlobalTabletEnv(env *tabletEnv) {
+	globalTabletEnvMu.Lock()
+	defer globalTabletEnvMu.Unlock()
+	globalTabletEnv = env
+}
+
+func getGlobalTabletEnv() *tabletEnv {
+	globalTabletEnvMu.Lock()
+	defer globalTabletEnvMu.Unlock()
+	return globalTabletEnv
+}
 
 // explainTablet is the query service that simulates a tablet.
 //
@@ -85,9 +122,10 @@ func newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
 		config.TwoPCAbandonAge = 1.0
 		config.TwoPCEnable = true
 	}
+	config.EnableOnlineDDL = false
 
 	// XXX much of this is cloned from the tabletserver tests
-	tsv := tabletserver.NewTabletServer(topoproto.TabletAliasString(t.Alias), config, memorytopo.NewServer(""), *t.Alias)
+	tsv := tabletserver.NewTabletServer(topoproto.TabletAliasString(t.Alias), config, memorytopo.NewServer(""), t.Alias)
 
 	tablet := explainTablet{db: db, tsv: tsv}
 	db.Handler = &tablet
@@ -108,9 +146,9 @@ func newTablet(opts *Options, t *topodatapb.Tablet) *explainTablet {
 	target := querypb.Target{
 		Keyspace:   t.Keyspace,
 		Shard:      t.Shard,
-		TabletType: topodatapb.TabletType_MASTER,
+		TabletType: topodatapb.TabletType_PRIMARY,
 	}
-	tsv.StartService(target, dbcfgs, nil /* mysqld */)
+	tsv.StartService(&target, dbcfgs, nil /* mysqld */)
 
 	// clear all the schema initialization queries out of the tablet
 	// to avoid clutttering the output
@@ -230,26 +268,6 @@ func (t *explainTablet) ReadTransaction(ctx context.Context, target *querypb.Tar
 	return t.tsv.ReadTransaction(ctx, target, dtid)
 }
 
-// ExecuteBatch is part of the QueryService interface.
-func (t *explainTablet) ExecuteBatch(ctx context.Context, target *querypb.Target, queries []*querypb.BoundQuery, asTransaction bool, transactionID int64, options *querypb.ExecuteOptions) ([]sqltypes.Result, error) {
-	t.mu.Lock()
-	t.currentTime = batchTime.Wait()
-
-	// Since the query is simulated being "sent" over the wire we need to
-	// copy the bindVars into the executor to avoid a data race.
-	for _, query := range queries {
-		query.BindVariables = sqltypes.CopyBindVariables(query.BindVariables)
-		t.tabletQueries = append(t.tabletQueries, &TabletQuery{
-			Time:     t.currentTime,
-			SQL:      query.Sql,
-			BindVars: query.BindVariables,
-		})
-	}
-	t.mu.Unlock()
-
-	return t.tsv.ExecuteBatch(ctx, target, queries, asTransaction, transactionID, options)
-}
-
 // BeginExecute is part of the QueryService interface.
 func (t *explainTablet) BeginExecute(ctx context.Context, target *querypb.Target, preQueries []string, sql string, bindVariables map[string]*querypb.BindVariable, reservedID int64, options *querypb.ExecuteOptions) (*sqltypes.Result, int64, *topodatapb.TabletAlias, error) {
 	t.mu.Lock()
@@ -270,9 +288,9 @@ func (t *explainTablet) Close(ctx context.Context) error {
 	return t.tsv.Close(ctx)
 }
 
-func initTabletEnvironment(ddls []*sqlparser.DDL, opts *Options) error {
-	tableColumns = make(map[string]map[string]querypb.Type)
-	schemaQueries = map[string]*sqltypes.Result{
+func newTabletEnvironment(ddls []sqlparser.DDLStatement, opts *Options) (*tabletEnv, error) {
+	tEnv := newTabletEnv()
+	schemaQueries := map[string]*sqltypes.Result{
 		"select unix_timestamp()": {
 			Fields: []*querypb.Field{{
 				Type: sqltypes.Uint64,
@@ -366,31 +384,68 @@ func initTabletEnvironment(ddls []*sqlparser.DDL, opts *Options) error {
 			}},
 			Rows: [][]sqltypes.Value{},
 		},
+		mysql.ShowRowsRead: sqltypes.MakeTestResult(
+			sqltypes.MakeTestFields(
+				"Variable_name|value",
+				"varchar|uint64",
+			),
+			"Innodb_rows|0",
+		),
+	}
+
+	for query, result := range schemaQueries {
+		tEnv.addResult(query, result)
+	}
+	for _, query := range onlineddl.ApplyDDL {
+		tEnv.addResult(query, &sqltypes.Result{
+			Fields: []*querypb.Field{{Type: sqltypes.Uint64}},
+			Rows:   [][]sqltypes.Value{},
+		})
 	}
 
 	showTableRows := make([][]sqltypes.Value, 0, 4)
 	for _, ddl := range ddls {
-		table := ddl.Table.Name.String()
-		showTableRows = append(showTableRows, mysql.BaseShowTablesRow(table, false, ""))
+		table := ddl.GetTable().Name.String()
+		options := ""
+		spec := ddl.GetTableSpec()
+		if spec != nil {
+			for _, option := range spec.Options {
+				if option.Name == "comment" && string(option.Value.Val) == "vitess_sequence" {
+					options = "vitess_sequence"
+				}
+			}
+		}
+		showTableRows = append(showTableRows, mysql.BaseShowTablesRow(table, false, options))
 	}
-	schemaQueries[mysql.BaseShowTables] = &sqltypes.Result{
+	tEnv.addResult(mysql.TablesWithSize57, &sqltypes.Result{
 		Fields: mysql.BaseShowTablesFields,
 		Rows:   showTableRows,
-	}
+	})
 
 	indexRows := make([][]sqltypes.Value, 0, 4)
 	for _, ddl := range ddls {
-		table := sqlparser.String(ddl.Table.Name)
+		table := sqlparser.String(ddl.GetTable().Name)
+		backtickedTable := sqlescape.EscapeID(sqlescape.UnescapeID(table))
+		if ddl.GetOptLike() != nil {
+			likeTable := ddl.GetOptLike().LikeTable.Name.String()
+			backtickedLikeTable := sqlescape.EscapeID(sqlescape.UnescapeID(likeTable))
 
-		if ddl.OptLike != nil {
-			likeTable := ddl.OptLike.LikeTable.Name.String()
-			if _, ok := schemaQueries["select * from "+likeTable+" where 1 != 1"]; !ok {
-				return fmt.Errorf("check your schema, table[%s] doesn't exist", likeTable)
+			likeQuery := "SELECT * FROM " + backtickedLikeTable + " WHERE 1 != 1"
+			query := "SELECT * FROM " + backtickedTable + " WHERE 1 != 1"
+			if tEnv.getResult(likeQuery) == nil {
+				return nil, fmt.Errorf("check your schema, table[%s] doesn't exist", likeTable)
 			}
-			schemaQueries["select * from "+table+" where 1 != 1"] = schemaQueries["select * from "+likeTable+" where 1 != 1"]
+			tEnv.addResult(query, tEnv.getResult(likeQuery))
+
+			likeQuery = fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqlescape.UnescapeID(likeTable))
+			query = fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqlescape.UnescapeID(table))
+			if tEnv.getResult(likeQuery) == nil {
+				return nil, fmt.Errorf("check your schema, table[%s] doesn't exist", likeTable)
+			}
+			tEnv.addResult(query, tEnv.getResult(likeQuery))
 			continue
 		}
-		for _, idx := range ddl.TableSpec.Indexes {
+		for _, idx := range ddl.GetTableSpec().Indexes {
 			if !idx.Info.Primary {
 				continue
 			}
@@ -400,28 +455,41 @@ func initTabletEnvironment(ddls []*sqlparser.DDL, opts *Options) error {
 			}
 		}
 
-		tableColumns[table] = make(map[string]querypb.Type)
+		tEnv.tableColumns[table] = make(map[string]querypb.Type)
 		var rowTypes []*querypb.Field
-		for _, col := range ddl.TableSpec.Columns {
+		var colTypes []*querypb.Field
+		var colValues [][]sqltypes.Value
+		colType := &querypb.Field{
+			Name: "column_type",
+			Type: sqltypes.VarChar,
+		}
+		colTypes = append(colTypes, colType)
+		for _, col := range ddl.GetTableSpec().Columns {
 			colName := strings.ToLower(col.Name.String())
 			rowType := &querypb.Field{
 				Name: colName,
 				Type: col.Type.SQLType(),
 			}
 			rowTypes = append(rowTypes, rowType)
-			tableColumns[table][colName] = col.Type.SQLType()
+			tEnv.tableColumns[table][colName] = col.Type.SQLType()
+			colValues = append(colValues, []sqltypes.Value{sqltypes.NewVarChar(colName)})
 		}
-		schemaQueries["select * from "+table+" where 1 != 1"] = &sqltypes.Result{
+		tEnv.addResult("SELECT * FROM "+backtickedTable+" WHERE 1 != 1", &sqltypes.Result{
 			Fields: rowTypes,
-		}
+		})
+		query := fmt.Sprintf(mysqlctl.GetColumnNamesQuery, "database()", sqlescape.UnescapeID(table))
+		tEnv.addResult(query, &sqltypes.Result{
+			Fields: colTypes,
+			Rows:   colValues,
+		})
 	}
 
-	schemaQueries[mysql.BaseShowPrimary] = &sqltypes.Result{
+	tEnv.addResult(mysql.BaseShowPrimary, &sqltypes.Result{
 		Fields: mysql.ShowPrimaryFields,
 		Rows:   indexRows,
-	}
+	})
 
-	return nil
+	return tEnv, nil
 }
 
 // HandleQuery implements the fakesqldb query handler interface
@@ -437,11 +505,12 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	}
 
 	// return the pre-computed results for any schema introspection queries
-	result, ok := schemaQueries[query]
-	if ok {
+	tEnv := getGlobalTabletEnv()
+	result := tEnv.getResult(query)
+
+	if result != nil {
 		return callback(result)
 	}
-
 	switch sqlparser.Preview(query) {
 	case sqlparser.StmtSelect:
 		// Parse the select statement to figure out the table and columns
@@ -457,32 +526,48 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 		case *sqlparser.Select:
 			selStmt = stmt
 		case *sqlparser.Union:
-			selStmt = stmt.FirstStatement.(*sqlparser.Select)
+			selStmt = sqlparser.GetFirstSelect(stmt)
 		default:
 			return fmt.Errorf("vtexplain: unsupported statement type +%v", reflect.TypeOf(stmt))
 		}
 
-		if len(selStmt.From) != 1 {
-			return fmt.Errorf("unsupported select with multiple from clauses")
+		// Gen4 supports more complex queries so we now need to
+		// handle multiple FROM clauses
+		tables := make([]*sqlparser.AliasedTableExpr, len(selStmt.From))
+		for _, from := range selStmt.From {
+			tables = append(tables, getTables(from)...)
 		}
 
-		var table sqlparser.TableIdent
-		switch node := selStmt.From[0].(type) {
-		case *sqlparser.AliasedTableExpr:
-			table = sqlparser.GetTableName(node.Expr)
-		}
+		tableColumnMap := map[sqlparser.TableIdent]map[string]querypb.Type{}
+		for _, table := range tables {
+			if table == nil {
+				continue
+			}
 
-		// For complex select queries just return an empty result
-		// since it's too hard to figure out the real columns
-		if table.IsEmpty() {
-			log.V(100).Infof("query %s result {}\n", query)
-			return callback(&sqltypes.Result{})
-		}
+			tableName := sqlparser.String(sqlparser.GetTableName(table.Expr))
+			columns, exists := getGlobalTabletEnv().tableColumns[tableName]
+			if !exists && tableName != "" && tableName != "dual" {
+				return fmt.Errorf("unable to resolve table name %s", tableName)
+			}
 
-		tableName := sqlparser.String(table)
-		colTypeMap := tableColumns[tableName]
-		if colTypeMap == nil && tableName != "dual" {
-			return fmt.Errorf("unable to resolve table name %s", tableName)
+			colTypeMap := map[string]querypb.Type{}
+
+			if table.As.IsEmpty() {
+				tableColumnMap[sqlparser.GetTableName(table.Expr)] = colTypeMap
+			} else {
+				tableColumnMap[table.As] = colTypeMap
+			}
+
+			for k, v := range columns {
+				if colType, exists := colTypeMap[k]; exists {
+					if colType != v {
+						return fmt.Errorf("column type mismatch for column : %s, types: %d vs %d", k, colType, v)
+					}
+					continue
+				}
+				colTypeMap[k] = v
+			}
+
 		}
 
 		colNames := make([]string, 0, 4)
@@ -490,11 +575,23 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 		for _, node := range selStmt.SelectExprs {
 			switch node := node.(type) {
 			case *sqlparser.AliasedExpr:
-				colNames, colTypes = inferColTypeFromExpr(node.Expr, colTypeMap, colNames, colTypes)
+				colNames, colTypes = inferColTypeFromExpr(node.Expr, tableColumnMap, colNames, colTypes)
 			case *sqlparser.StarExpr:
-				for col, colType := range colTypeMap {
-					colNames = append(colNames, col)
-					colTypes = append(colTypes, colType)
+				if node.TableName.Name.IsEmpty() {
+					// SELECT *
+					for _, colTypeMap := range tableColumnMap {
+						for col, colType := range colTypeMap {
+							colNames = append(colNames, col)
+							colTypes = append(colTypes, colType)
+						}
+					}
+				} else {
+					// SELECT tableName.*
+					colTypeMap := tableColumnMap[node.TableName.Name]
+					for col, colType := range colTypeMap {
+						colNames = append(colNames, col)
+						colTypes = append(colTypes, colType)
+					}
 				}
 			}
 		}
@@ -506,7 +603,7 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 		if selStmt.Where != nil {
 			switch v := selStmt.Where.Expr.(type) {
 			case *sqlparser.ComparisonExpr:
-				if v.Operator == sqlparser.InStr {
+				if v.Operator == sqlparser.InOp {
 					switch c := v.Left.(type) {
 					case *sqlparser.ColName:
 						switch values := v.Right.(type) {
@@ -514,7 +611,7 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 							for _, val := range values {
 								switch v := val.(type) {
 								case *sqlparser.Literal:
-									inVal = append(inVal, v.Val)
+									inVal = append(inVal, v.Bytes())
 								}
 							}
 							rowCount = len(inVal)
@@ -564,8 +661,11 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 		resultJSON, _ := json.MarshalIndent(result, "", "    ")
 		log.V(100).Infof("query %s result %s\n", query, string(resultJSON))
 
-	case sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtSet, sqlparser.StmtShow:
+	case sqlparser.StmtBegin, sqlparser.StmtCommit, sqlparser.StmtSet,
+		sqlparser.StmtSavepoint, sqlparser.StmtSRollback, sqlparser.StmtRelease:
 		result = &sqltypes.Result{}
+	case sqlparser.StmtShow:
+		result = &sqltypes.Result{Fields: sqltypes.MakeTestFields("", "")}
 	case sqlparser.StmtInsert, sqlparser.StmtReplace, sqlparser.StmtUpdate, sqlparser.StmtDelete:
 		result = &sqltypes.Result{
 			RowsAffected: 1,
@@ -577,17 +677,58 @@ func (t *explainTablet) HandleQuery(c *mysql.Conn, query string, callback func(*
 	return callback(result)
 }
 
-func inferColTypeFromExpr(node sqlparser.Expr, colTypeMap map[string]querypb.Type, colNames []string, colTypes []querypb.Type) ([]string, []querypb.Type) {
+func getTables(node sqlparser.SQLNode) []*sqlparser.AliasedTableExpr {
+	var tables []*sqlparser.AliasedTableExpr
+	switch expr := node.(type) {
+	case *sqlparser.AliasedTableExpr:
+		tables = append(tables, expr)
+	case *sqlparser.JoinTableExpr:
+		tables = append(tables, getTables(expr.LeftExpr)...)
+		tables = append(tables, getTables(expr.RightExpr)...)
+	}
+	return tables
+}
+
+func inferColTypeFromExpr(node sqlparser.Expr, tableColumnMap map[sqlparser.TableIdent]map[string]querypb.Type, colNames []string, colTypes []querypb.Type) ([]string, []querypb.Type) {
 	switch node := node.(type) {
 	case *sqlparser.ColName:
-		col := strings.ToLower(node.Name.String())
-		colType := colTypeMap[col]
-		if colType == querypb.Type_NULL_TYPE {
-			log.Errorf("vtexplain: invalid column %s, typeMap +%v", col, colTypeMap)
+		if node.Qualifier.Name.IsEmpty() {
+			// Unqualified column name, try to search for it across all tables
+			col := strings.ToLower(node.Name.String())
+
+			var colType querypb.Type
+
+			for _, colTypeMap := range tableColumnMap {
+				if colTypeMap[col] != querypb.Type_NULL_TYPE {
+					if colType != querypb.Type_NULL_TYPE {
+						log.Errorf("vtexplain: ambiguous column %s", col)
+						return colNames, colTypes
+					}
+
+					colType = colTypeMap[col]
+				}
+			}
+
+			if colType == querypb.Type_NULL_TYPE {
+				log.Errorf("vtexplain: invalid column %s.%s, tableColumnMap +%v", node.Qualifier.Name, col, tableColumnMap)
+			}
+
+			colNames = append(colNames, col)
+			colTypes = append(colTypes, colType)
+		} else {
+			// Qualified column name, try to look it up
+			colTypeMap := tableColumnMap[node.Qualifier.Name]
+			col := strings.ToLower(node.Name.String())
+			colType := colTypeMap[col]
+
+			if colType == querypb.Type_NULL_TYPE {
+				log.Errorf("vtexplain: invalid column %s.%s, tableColumnMap +%v", node.Qualifier.Name, col, tableColumnMap)
+			}
+
+			colNames = append(colNames, col)
+			colTypes = append(colTypes, colType)
 		}
-		colNames = append(colNames, col)
-		colTypes = append(colTypes, colType)
-	case *sqlparser.FuncExpr:
+	case sqlparser.Callable:
 		// As a shortcut, functions are integral types
 		colNames = append(colNames, sqlparser.String(node))
 		colTypes = append(colTypes, querypb.Type_INT32)
@@ -606,14 +747,19 @@ func inferColTypeFromExpr(node sqlparser.Expr, colTypeMap map[string]querypb.Typ
 			colTypes = append(colTypes, querypb.Type_VARCHAR)
 		case sqlparser.FloatVal:
 			colTypes = append(colTypes, querypb.Type_FLOAT64)
+		case sqlparser.DecimalVal:
+			colTypes = append(colTypes, querypb.Type_DECIMAL)
 		default:
 			log.Errorf("vtexplain: unsupported sql value %s", sqlparser.String(node))
 		}
 	case *sqlparser.CaseExpr:
-		colNames, colTypes = inferColTypeFromExpr(node.Whens[0].Val, colTypeMap, colNames, colTypes)
+		colNames, colTypes = inferColTypeFromExpr(node.Whens[0].Val, tableColumnMap, colNames, colTypes)
 	case *sqlparser.NullVal:
 		colNames = append(colNames, sqlparser.String(node))
 		colTypes = append(colTypes, querypb.Type_NULL_TYPE)
+	case *sqlparser.ComparisonExpr:
+		colNames = append(colNames, sqlparser.String(node))
+		colTypes = append(colTypes, querypb.Type_INT64)
 	default:
 		log.Errorf("vtexplain: unsupported select expression type +%v node %s", reflect.TypeOf(node), sqlparser.String(node))
 	}

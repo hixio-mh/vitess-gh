@@ -25,7 +25,7 @@ import (
 	"html/template"
 	"time"
 
-	"golang.org/x/net/context"
+	"context"
 
 	"vitess.io/vitess/go/stats"
 )
@@ -121,10 +121,10 @@ var (
 )
 
 const (
-	retryCategoryReadOnly          = "ReadOnly"
-	retryCategoryTimeoutError      = "TimeoutError"
-	retryCategoryConnectionError   = "ConnectionError"
-	retryCategoryNoMasterAvailable = "NoMasterAvailable"
+	retryCategoryReadOnly           = "ReadOnly"
+	retryCategoryTimeoutError       = "TimeoutError"
+	retryCategoryConnectionError    = "ConnectionError"
+	retryCategoryNoPrimaryAvailable = "NoPrimaryAvailable"
 )
 
 // resetVars resets the debug variables that are meant to provide information on a

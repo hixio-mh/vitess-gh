@@ -17,8 +17,10 @@ limitations under the License.
 package mysqlctl
 
 import (
+	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -26,8 +28,6 @@ import (
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/vterrors"
 	"vitess.io/vitess/go/vt/vtgate/evalengine"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/sqlescape"
 	"vitess.io/vitess/go/vt/log"
@@ -57,10 +57,10 @@ func encodeTableName(tableName string) string {
 	return buf.String()
 }
 
-// tableListSql returns an IN clause "('t1', 't2'...) for a list of tables."
-func tableListSql(tables []string) (string, error) {
+// tableListSQL returns an IN clause "('t1', 't2'...) for a list of tables."
+func tableListSQL(tables []string) (string, error) {
 	if len(tables) == 0 {
-		return "", vterrors.New(vtrpc.Code_INTERNAL, "no tables for tableListSql")
+		return "", vterrors.New(vtrpc.Code_INTERNAL, "no tables for tableListSQL")
 	}
 
 	encodedTables := make([]string, len(tables))
@@ -127,7 +127,6 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 		go func() {
 			defer wg.Done()
 
-			log.Infof("mysqld GetSchema: GetPrimaryKeyColumns")
 			var err error
 			colMap, err = mysqld.getPrimaryKeyColumns(ctx, dbName, tableNames...)
 			if err != nil {
@@ -135,7 +134,6 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 				cancel()
 				return
 			}
-			log.Infof("mysqld GetSchema: GetPrimaryKeyColumns done")
 		}()
 	}
 
@@ -144,11 +142,9 @@ func (mysqld *Mysqld) GetSchema(ctx context.Context, dbName string, tables, excl
 		return nil, err
 	}
 
-	log.Infof("mysqld GetSchema: Collecting all table schemas")
 	for _, td := range tds {
 		td.PrimaryKeyColumns = colMap[td.Name]
 	}
-	log.Infof("mysqld GetSchema: Collecting all table schemas done")
 
 	sd.TableDefinitions = tds
 
@@ -175,7 +171,7 @@ func (mysqld *Mysqld) collectBasicTableData(ctx context.Context, dbName string, 
 		return nil, err
 	}
 
-	tds := make([]*tabletmanagerdatapb.TableDefinition, 0, len(qr.Rows))
+	tds := make(tableDefinitions, 0, len(qr.Rows))
 	for _, row := range qr.Rows {
 		tableName := row[0].ToString()
 		tableType := row[1].ToString()
@@ -211,6 +207,8 @@ func (mysqld *Mysqld) collectBasicTableData(ctx context.Context, dbName string, 
 		})
 	}
 
+	sort.Sort(tds)
+
 	return tds, nil
 }
 
@@ -231,7 +229,7 @@ func (mysqld *Mysqld) collectSchema(ctx context.Context, dbName, tableName, tabl
 // normalizedSchema returns a table schema with database names replaced, and auto_increment annotations removed.
 func (mysqld *Mysqld) normalizedSchema(ctx context.Context, dbName, tableName, tableType string) (string, error) {
 	backtickDBName := sqlescape.EscapeID(dbName)
-	qr, fetchErr := mysqld.FetchSuperQuery(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", dbName, sqlescape.EscapeID(tableName)))
+	qr, fetchErr := mysqld.FetchSuperQuery(ctx, fmt.Sprintf("SHOW CREATE TABLE %s.%s", backtickDBName, sqlescape.EscapeID(tableName)))
 	if fetchErr != nil {
 		return "", fetchErr
 	}
@@ -267,15 +265,60 @@ func ResolveTables(ctx context.Context, mysqld MysqlDaemon, dbName string, table
 	return result, nil
 }
 
-// GetColumns returns the columns of table.
-func (mysqld *Mysqld) GetColumns(ctx context.Context, dbName, table string) ([]*querypb.Field, []string, error) {
-	conn, err := getPoolReconnect(ctx, mysqld.dbaPool)
+const (
+	GetColumnNamesQuery = `SELECT COLUMN_NAME as column_name
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = %s AND TABLE_NAME = '%s'
+		ORDER BY ORDINAL_POSITION`
+	GetFieldsQuery = "SELECT %s FROM %s WHERE 1 != 1"
+)
+
+func GetColumnsList(dbName, tableName string, exec func(string, int, bool) (*sqltypes.Result, error)) (string, error) {
+	var dbName2 string
+	if dbName == "" {
+		dbName2 = "database()"
+	} else {
+		dbName2 = fmt.Sprintf("'%s'", dbName)
+	}
+	query := fmt.Sprintf(GetColumnNamesQuery, dbName2, sqlescape.UnescapeID(tableName))
+	qr, err := exec(query, -1, true)
+	if err != nil {
+		return "", err
+	}
+	if qr == nil || len(qr.Rows) == 0 {
+		err = fmt.Errorf("unable to get columns for table %s.%s using query %s", dbName, tableName, query)
+		log.Errorf("%s", fmt.Errorf("unable to get columns for table %s.%s using query %s", dbName, tableName, query))
+		return "", err
+	}
+	selectColumns := ""
+
+	for _, row := range qr.Named().Rows {
+		col := row["column_name"].ToString()
+		if col == "" {
+			continue
+		}
+		if selectColumns != "" {
+			selectColumns += ", "
+		}
+		selectColumns += sqlescape.EscapeID(col)
+	}
+	return selectColumns, nil
+}
+
+func GetColumns(dbName, table string, exec func(string, int, bool) (*sqltypes.Result, error)) ([]*querypb.Field, []string, error) {
+	selectColumns, err := GetColumnsList(dbName, table, exec)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer conn.Recycle()
-
-	qr, err := conn.ExecuteFetch(fmt.Sprintf("SELECT * FROM %s.%s WHERE 1=0", sqlescape.EscapeID(dbName), sqlescape.EscapeID(table)), 0, true)
+	if selectColumns == "" {
+		selectColumns = "*"
+	}
+	tableSpec := sqlescape.EscapeID(sqlescape.UnescapeID(table))
+	if dbName != "" {
+		tableSpec = fmt.Sprintf("%s.%s", sqlescape.EscapeID(sqlescape.UnescapeID(dbName)), tableSpec)
+	}
+	query := fmt.Sprintf(GetFieldsQuery, selectColumns, tableSpec)
+	qr, err := exec(query, 0, true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -285,7 +328,16 @@ func (mysqld *Mysqld) GetColumns(ctx context.Context, dbName, table string) ([]*
 		columns[i] = field.Name
 	}
 	return qr.Fields, columns, nil
+}
 
+// GetColumns returns the columns of table.
+func (mysqld *Mysqld) GetColumns(ctx context.Context, dbName, table string) ([]*querypb.Field, []string, error) {
+	conn, err := getPoolReconnect(ctx, mysqld.dbaPool)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer conn.Recycle()
+	return GetColumns(dbName, table, conn.ExecuteFetch)
 }
 
 // GetPrimaryKeyColumns returns the primary key columns of table.
@@ -305,21 +357,18 @@ func (mysqld *Mysqld) getPrimaryKeyColumns(ctx context.Context, dbName string, t
 	}
 	defer conn.Recycle()
 
-	tableList, err := tableListSql(tables)
+	tableList, err := tableListSQL(tables)
 	if err != nil {
 		return nil, err
 	}
 	// sql uses column name aliases to guarantee lower case sensitivity.
-	sql := fmt.Sprintf(`
-		SELECT
-			table_name AS table_name,
-			ordinal_position AS ordinal_position,
-			column_name AS column_name
-		FROM information_schema.key_column_usage
-		WHERE table_schema = '%s'
-			AND table_name IN %s
-			AND constraint_name='PRIMARY'
-		ORDER BY table_name, ordinal_position`, dbName, tableList)
+	sql := `SELECT table_name as table_name, ordinal_position as ordinal_position, COLUMN_NAME as column_name
+		FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = '%s'
+		AND TABLE_NAME IN %s
+		AND COLUMN_KEY = 'PRI'
+		ORDER BY table_name, ordinal_position;`
+	sql = fmt.Sprintf(sql, dbName, tableList)
 	qr, err := conn.ExecuteFetch(sql, len(tables)*100, true)
 	if err != nil {
 		return nil, err
@@ -440,6 +489,13 @@ func (mysqld *Mysqld) ApplySchemaChange(ctx context.Context, dbName string, chan
 	}
 
 	sql := change.SQL
+
+	// The session used is closed after applying the schema change so we do not need
+	// to worry about saving and restoring the session state here
+	if change.SQLMode != "" {
+		sql = fmt.Sprintf("SET @@session.sql_mode='%s';\n%s", change.SQLMode, sql)
+	}
+
 	if !change.AllowReplication {
 		sql = "SET sql_log_bin = 0;\n" + sql
 	}
@@ -476,3 +532,20 @@ func (mysqld *Mysqld) ApplySchemaChange(ctx context.Context, dbName string, chan
 
 	return &tabletmanagerdatapb.SchemaChangeResult{BeforeSchema: beforeSchema, AfterSchema: afterSchema}, nil
 }
+
+//tableDefinitions is a sortable collection of table definitions
+type tableDefinitions []*tabletmanagerdatapb.TableDefinition
+
+func (t tableDefinitions) Len() int {
+	return len(t)
+}
+
+func (t tableDefinitions) Less(i, j int) bool {
+	return t[i].Name < t[j].Name
+}
+
+func (t tableDefinitions) Swap(i, j int) {
+	t[i], t[j] = t[j], t[i]
+}
+
+var _ sort.Interface = (tableDefinitions)(nil)

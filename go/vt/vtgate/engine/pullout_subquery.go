@@ -61,22 +61,22 @@ func (ps *PulloutSubquery) GetTableName() string {
 	return ps.Underlying.GetTableName()
 }
 
-// Execute satisfies the Primitive interface.
-func (ps *PulloutSubquery) Execute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
+// TryExecute satisfies the Primitive interface.
+func (ps *PulloutSubquery) TryExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool) (*sqltypes.Result, error) {
 	combinedVars, err := ps.execSubquery(vcursor, bindVars)
 	if err != nil {
 		return nil, err
 	}
-	return ps.Underlying.Execute(vcursor, combinedVars, wantfields)
+	return vcursor.ExecutePrimitive(ps.Underlying, combinedVars, wantfields)
 }
 
-// StreamExecute performs a streaming exec.
-func (ps *PulloutSubquery) StreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
+// TryStreamExecute performs a streaming exec.
+func (ps *PulloutSubquery) TryStreamExecute(vcursor VCursor, bindVars map[string]*querypb.BindVariable, wantfields bool, callback func(*sqltypes.Result) error) error {
 	combinedVars, err := ps.execSubquery(vcursor, bindVars)
 	if err != nil {
 		return err
 	}
-	return ps.Underlying.StreamExecute(vcursor, combinedVars, wantfields, callback)
+	return vcursor.StreamExecutePrimitive(ps.Underlying, combinedVars, wantfields, callback)
 }
 
 // GetFields fetches the field info.
@@ -100,12 +100,22 @@ func (ps *PulloutSubquery) GetFields(vcursor VCursor, bindVars map[string]*query
 	return ps.Underlying.GetFields(vcursor, combinedVars)
 }
 
+// NeedsTransaction implements the Primitive interface
 func (ps *PulloutSubquery) NeedsTransaction() bool {
 	return ps.Subquery.NeedsTransaction() || ps.Underlying.NeedsTransaction()
 }
 
+var (
+	errSqRow    = vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "subquery returned more than one row")
+	errSqColumn = vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "subquery returned more than one column")
+)
+
 func (ps *PulloutSubquery) execSubquery(vcursor VCursor, bindVars map[string]*querypb.BindVariable) (map[string]*querypb.BindVariable, error) {
-	result, err := ps.Subquery.Execute(vcursor, bindVars, false)
+	subqueryBindVars := make(map[string]*querypb.BindVariable, len(bindVars))
+	for k, v := range bindVars {
+		subqueryBindVars[k] = v
+	}
+	result, err := vcursor.ExecutePrimitive(ps.Subquery, subqueryBindVars, false)
 	if err != nil {
 		return nil, err
 	}
@@ -120,11 +130,11 @@ func (ps *PulloutSubquery) execSubquery(vcursor VCursor, bindVars map[string]*qu
 			combinedVars[ps.SubqueryResult] = sqltypes.NullBindVariable
 		case 1:
 			if len(result.Rows[0]) != 1 {
-				return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "subquery returned more than one column")
+				return nil, errSqColumn
 			}
 			combinedVars[ps.SubqueryResult] = sqltypes.ValueBindVariable(result.Rows[0][0])
 		default:
-			return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "subquery returned more than one row")
+			return nil, errSqRow
 		}
 	case PulloutIn, PulloutNotIn:
 		switch len(result.Rows) {
@@ -137,7 +147,7 @@ func (ps *PulloutSubquery) execSubquery(vcursor VCursor, bindVars map[string]*qu
 			}
 		default:
 			if len(result.Rows[0]) != 1 {
-				return nil, vterrors.New(vtrpcpb.Code_INVALID_ARGUMENT, "subquery returned more than one column")
+				return nil, errSqColumn
 			}
 			combinedVars[ps.HasValues] = sqltypes.Int64BindVariable(1)
 			values := &querypb.BindVariable{
@@ -161,9 +171,21 @@ func (ps *PulloutSubquery) execSubquery(vcursor VCursor, bindVars map[string]*qu
 }
 
 func (ps *PulloutSubquery) description() PrimitiveDescription {
+	other := map[string]any{}
+	var pulloutVars []string
+	if ps.HasValues != "" {
+		pulloutVars = append(pulloutVars, ps.HasValues)
+	}
+	if ps.SubqueryResult != "" {
+		pulloutVars = append(pulloutVars, ps.SubqueryResult)
+	}
+	if len(pulloutVars) > 0 {
+		other["PulloutVars"] = pulloutVars
+	}
 	return PrimitiveDescription{
 		OperatorType: "Subquery",
 		Variant:      ps.Opcode.String(),
+		Other:        other,
 	}
 }
 

@@ -18,20 +18,19 @@ package schemamanager
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"reflect"
 	"strings"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
 	querypb "vitess.io/vitess/go/vt/proto/query"
 )
 
 func TestLocalControllerNoSchemaChanges(t *testing.T) {
-	schemaChangeDir, err := ioutil.TempDir("", "localcontroller-test")
+	schemaChangeDir, err := os.MkdirTemp("", "localcontroller-test")
 	defer os.RemoveAll(schemaChangeDir)
 	if err != nil {
 		t.Fatalf("failed to create temp schema change dir, error: %v", err)
@@ -59,7 +58,7 @@ func TestLocalControllerOpen(t *testing.T) {
 		t.Fatalf("Open should fail, no such dir, but got: %v", err)
 	}
 
-	schemaChangeDir, _ := ioutil.TempDir("", "localcontroller-test")
+	schemaChangeDir, _ := os.MkdirTemp("", "localcontroller-test")
 	defer os.RemoveAll(schemaChangeDir)
 
 	// create a file under schema change dir
@@ -101,7 +100,7 @@ func TestLocalControllerOpen(t *testing.T) {
 }
 
 func TestLocalControllerSchemaChange(t *testing.T) {
-	schemaChangeDir, err := ioutil.TempDir("", "localcontroller-test")
+	schemaChangeDir, err := os.MkdirTemp("", "localcontroller-test")
 	if err != nil {
 		t.Fatalf("failed to create temp schema change dir, error: %v", err)
 	}

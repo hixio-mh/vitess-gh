@@ -89,6 +89,13 @@ type MultiColumn interface {
 	Vindex
 	Map(vcursor VCursor, rowsColValues [][]sqltypes.Value) ([]key.Destination, error)
 	Verify(vcursor VCursor, rowsColValues [][]sqltypes.Value, ksids [][]byte) ([]bool, error)
+	// PartialVindex returns true if subset of columns can be passed in to the vindex Map and Verify function.
+	PartialVindex() bool
+}
+
+// Hashing defined the interface for the vindexes that export the Hash function to be used by multi-column vindex.
+type Hashing interface {
+	Hash(id sqltypes.Value) ([]byte, error)
 }
 
 // A Reversible vindex is one that can perform a
@@ -99,6 +106,14 @@ type MultiColumn interface {
 type Reversible interface {
 	SingleColumn
 	ReverseMap(vcursor VCursor, ks [][]byte) ([]sqltypes.Value, error)
+}
+
+// A Prefixable vindex is one that maps the prefix of a id to a keyspace range
+// instead of a single keyspace id. It's being used to reduced the fan out for
+// 'LIKE' expressions.
+type Prefixable interface {
+	SingleColumn
+	PrefixVindex() SingleColumn
 }
 
 // A Lookup vindex is one that needs to lookup
@@ -118,6 +133,11 @@ type Lookup interface {
 
 	// Update replaces the mapping of old values with new values for a keyspace id.
 	Update(vc VCursor, oldValues []sqltypes.Value, ksid []byte, newValues []sqltypes.Value) error
+}
+
+// LookupBackfill interfaces all lookup vindexes that can backfill rows, such as LookupUnique.
+type LookupBackfill interface {
+	IsBackfilling() bool
 }
 
 // WantOwnerInfo defines the interface that a vindex must
@@ -163,7 +183,7 @@ func Map(vindex Vindex, vcursor VCursor, rowsColValues [][]sqltypes.Value) ([]ke
 	case SingleColumn:
 		return vindex.Map(vcursor, firstColsOnly(rowsColValues))
 	}
-	return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "vindex does not have Map functions")
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vindex '%T' does not have Map function", vindex)
 }
 
 // Verify invokes the Verify implementation supplied by the vindex.
@@ -174,7 +194,7 @@ func Verify(vindex Vindex, vcursor VCursor, rowsColValues [][]sqltypes.Value, ks
 	case SingleColumn:
 		return vindex.Verify(vcursor, firstColsOnly(rowsColValues), ksids)
 	}
-	return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "vindex does not have Map functions")
+	return nil, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "vindex '%T' does not have Verify function", vindex)
 }
 
 func firstColsOnly(rowsColValues [][]sqltypes.Value) []sqltypes.Value {

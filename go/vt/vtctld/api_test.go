@@ -18,14 +18,13 @@ package vtctld
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"golang.org/x/net/context"
 
 	"vitess.io/vitess/go/vt/topo/memorytopo"
 	"vitess.io/vitess/go/vt/wrangler"
@@ -37,7 +36,7 @@ import (
 func compactJSON(in []byte) string {
 	buf := &bytes.Buffer{}
 	json.Compact(buf, in)
-	return buf.String()
+	return strings.ReplaceAll(buf.String(), "\n", "")
 }
 
 func TestAPI(t *testing.T) {
@@ -102,15 +101,15 @@ func TestAPI(t *testing.T) {
 
 	// Populate fake actions.
 	actionRepo.RegisterKeyspaceAction("TestKeyspaceAction",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace string) (string, error) {
 			return "TestKeyspaceAction Result", nil
 		})
 	actionRepo.RegisterShardAction("TestShardAction",
-		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, keyspace, shard string) (string, error) {
 			return "TestShardAction Result", nil
 		})
 	actionRepo.RegisterTabletAction("TestTabletAction", "",
-		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias, r *http.Request) (string, error) {
+		func(ctx context.Context, wr *wrangler.Wrangler, tabletAlias *topodatapb.TabletAlias) (string, error) {
 			return "TestTabletAction Result", nil
 		})
 
@@ -153,7 +152,7 @@ func TestAPI(t *testing.T) {
 			"mysql_port": 3306,
 			"stats": {
 				"realtime": {
-					"seconds_behind_master": 100
+					"replication_lag_seconds": 100
 				},
 				"serving": true,
 				"up": true
@@ -221,7 +220,7 @@ func TestAPI(t *testing.T) {
 				"mysql_port": 3306,
 				"stats": {
 					"realtime": {
-						"seconds_behind_master": 100
+						"replication_lag_seconds": 100
 					},
 					"serving": true,
 					"up": true
@@ -274,16 +273,15 @@ func TestAPI(t *testing.T) {
 		// Shards
 		{"GET", "shards/ks1/", "", `["-80","80-"]`, http.StatusOK},
 		{"GET", "shards/ks1/-80", "", `{
-				"master_alias": null,
-				"master_term_start_time":null,
+				"primary_alias": null,
+				"primary_term_start_time":null,
 				"key_range": {
-					"start": null,
+					"start": "",
 					"end":"gA=="
 				},
-				"served_types": [],
 				"source_shards": [],
 				"tablet_controls": [],
-				"is_master_serving": true
+				"is_primary_serving": true
 			}`, http.StatusOK},
 		{"GET", "shards/ks1/-DEAD", "", "404 page not found", http.StatusNotFound},
 		{"POST", "shards/ks1/-80?action=TestShardAction", "", `{
@@ -378,7 +376,7 @@ func TestAPI(t *testing.T) {
 		// Tablet Health
 		{"GET", "tablet_health/cell1/100", "", `{ "Key": "", "Tablet": { "alias": { "cell": "cell1", "uid": 100 },"port_map": { "vt": 100 }, "keyspace": "ks1", "shard": "-80", "type": 2},
 		  "Name": "", "Target": { "keyspace": "ks1", "shard": "-80", "tablet_type": 2 }, "Up": true, "Serving": true, "TabletExternallyReparentedTimestamp": 0,
-		  "Stats": { "seconds_behind_master": 100 }, "LastError": null }`, http.StatusOK},
+		  "Stats": { "replication_lag_seconds": 100 }, "LastError": null }`, http.StatusOK},
 		{"GET", "tablet_health/cell1", "", "can't get tablet_health: invalid tablet_health path: \"cell1\"  expected path: /tablet_health/<cell>/<uid>", http.StatusInternalServerError},
 		{"GET", "tablet_health/cell1/gh", "", "can't get tablet_health: incorrect uid", http.StatusInternalServerError},
 
@@ -397,11 +395,11 @@ func TestAPI(t *testing.T) {
 		// vtctl RunCommand
 		{"POST", "vtctl/", `["GetKeyspace","ks1"]`, `{
 		   "Error": "",
-		   "Output": "{\n  \"sharding_column_name\": \"shardcol\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [\n  ],\n  \"keyspace_type\": 0,\n  \"base_keyspace\": \"\",\n  \"snapshot_time\": null\n}\n\n"
+		   "Output": "{\n  \"sharding_column_name\": \"shardcol\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [],\n  \"keyspace_type\": 0,\n  \"base_keyspace\": \"\",\n  \"snapshot_time\": null\n}\n\n"
 		}`, http.StatusOK},
 		{"POST", "vtctl/", `["GetKeyspace","ks3"]`, `{
 		   "Error": "",
-		   "Output": "{\n  \"sharding_column_name\": \"\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [\n  ],\n  \"keyspace_type\": 1,\n  \"base_keyspace\": \"ks1\",\n  \"snapshot_time\": {\n    \"seconds\": \"1136214245\",\n    \"nanoseconds\": 0\n  }\n}\n\n"
+		   "Output": "{\n  \"sharding_column_name\": \"\",\n  \"sharding_column_type\": 0,\n  \"served_froms\": [],\n  \"keyspace_type\": 1,\n  \"base_keyspace\": \"ks1\",\n  \"snapshot_time\": {\n    \"seconds\": \"1136214245\",\n    \"nanoseconds\": 0\n  }\n}\n\n"
 		}`, http.StatusOK},
 		{"POST", "vtctl/", `["GetVSchema","ks3"]`, `{
 		   "Error": "",
@@ -433,11 +431,11 @@ func TestAPI(t *testing.T) {
 				return
 			}
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
 			if err != nil {
-				t.Fatalf("[%v] ioutil.ReadAll(resp.Body) error: %v", in.path, err)
+				t.Fatalf("[%v] io.ReadAll(resp.Body) error: %v", in.path, err)
 				return
 			}
 

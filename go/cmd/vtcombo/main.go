@@ -22,13 +22,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"vitess.io/vitess/go/vt/vttest"
+
+	"google.golang.org/protobuf/proto"
+
 	"vitess.io/vitess/go/exit"
 	"vitess.io/vitess/go/vt/dbconfigs"
 	"vitess.io/vitess/go/vt/log"
@@ -43,13 +46,14 @@ import (
 	"vitess.io/vitess/go/vt/vtctld"
 	"vitess.io/vitess/go/vt/vtgate"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/tabletenv"
+	"vitess.io/vitess/go/vt/wrangler"
 
 	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
 	vttestpb "vitess.io/vitess/go/vt/proto/vttest"
 )
 
 var (
-	protoTopo = flag.String("proto_topo", "", "vttest proto definition of the topology, encoded in compact text format. See vttest.proto for more information.")
+	tpb vttestpb.VTTestTopology
 
 	schemaDir = flag.String("schema_dir", "", "Schema base directory. Should contain one directory per keyspace, with a vschema.json file if necessary.")
 
@@ -57,11 +61,17 @@ var (
 
 	mysqlPort = flag.Int("mysql_port", 3306, "mysql port")
 
+	externalTopoServer = flag.Bool("external_topo_server", false, "Should vtcombo use an external topology server instead of starting its own in-memory topology server. "+
+		"If true, vtcombo will use the flags defined in topo/server.go to open topo server")
+
 	ts              *topo.Server
 	resilientServer *srvtopo.ResilientServer
 )
 
 func init() {
+	flag.Var(vttest.TextTopoData(&tpb), "proto_topo", "vttest proto definition of the topology, encoded in compact text format. See vttest.proto for more information.")
+	flag.Var(vttest.JsonTopoData(&tpb), "json_topo", "vttest proto definition of the topology, encoded in json format. See vttest.proto for more information.")
+
 	servenv.RegisterDefaultFlags()
 }
 
@@ -111,19 +121,17 @@ func main() {
 	mysqlctl.RegisterFlags()
 	servenv.ParseFlags("vtcombo")
 
-	// parse the input topology
-	tpb := &vttestpb.VTTestTopology{}
-	if err := proto.UnmarshalText(*protoTopo, tpb); err != nil {
-		log.Errorf("cannot parse topology: %v", err)
-		exit.Return(1)
-	}
+	// Stash away a copy of the topology that vtcombo was started with.
+	//
+	// We will use this to determine the shard structure when keyspaces
+	// get recreated.
+	originalTopology := proto.Clone(&tpb).(*vttestpb.VTTestTopology)
 
 	// default cell to "test" if unspecified
 	if len(tpb.Cells) == 0 {
 		tpb.Cells = append(tpb.Cells, "test")
 	}
 
-	// set discoverygateway flag to default value
 	flag.Set("cells_to_watch", strings.Join(tpb.Cells, ","))
 
 	// vtctld UI requires the cell flag
@@ -133,8 +141,21 @@ func main() {
 		flag.Set("log_dir", "$VTDATAROOT/tmp")
 	}
 
-	// Create topo server. We use a 'memorytopo' implementation.
-	ts = memorytopo.NewServer(tpb.Cells...)
+	if *externalTopoServer {
+		// Open topo server based on the command line flags defined at topo/server.go
+		// do not create cell info as it should be done by whoever sets up the external topo server
+		ts = topo.Open()
+	} else {
+		// Create topo server. We use a 'memorytopo' implementation.
+		ts = memorytopo.NewServer(tpb.Cells...)
+	}
+
+	// attempt to load any routing rules specified by tpb
+	if err := vtcombo.InitRoutingRules(context.Background(), ts, tpb.GetRoutingRules()); err != nil {
+		log.Errorf("Failed to load routing rules: %v", err)
+		exit.Return(1)
+	}
+
 	servenv.Init()
 	tabletenv.Init()
 
@@ -156,7 +177,8 @@ func main() {
 
 	// tablets configuration and init.
 	// Send mycnf as nil because vtcombo won't do backups and restores.
-	if err := vtcombo.InitTabletMap(ts, tpb, mysqld, &dbconfigs.GlobalDBConfigs, *schemaDir, nil, *startMysql); err != nil {
+	uid, err := vtcombo.InitTabletMap(ts, &tpb, mysqld, &dbconfigs.GlobalDBConfigs, *schemaDir, *startMysql)
+	if err != nil {
 		log.Errorf("initTabletMapProto failed: %v", err)
 		// ensure we start mysql in the event we fail here
 		if *startMysql {
@@ -165,9 +187,45 @@ func main() {
 		exit.Return(1)
 	}
 
+	globalCreateDb = func(ctx context.Context, ks *vttestpb.Keyspace) error {
+		// Check if we're recreating a keyspace that was previously deleted by looking
+		// at the original topology definition.
+		//
+		// If we find a matching keyspace, we create it with the same sharding
+		// configuration. This ensures that dropping and recreating a keyspace
+		// will end up with the same number of shards.
+		for _, originalKs := range originalTopology.Keyspaces {
+			if originalKs.Name == ks.Name {
+				ks = proto.Clone(originalKs).(*vttestpb.Keyspace)
+			}
+		}
+
+		wr := wrangler.New(logutil.NewConsoleLogger(), ts, nil)
+		newUID, err := vtcombo.CreateKs(ctx, ts, &tpb, mysqld, &dbconfigs.GlobalDBConfigs, *schemaDir, ks, true, uid, wr)
+		if err != nil {
+			return err
+		}
+		uid = newUID
+		tpb.Keyspaces = append(tpb.Keyspaces, ks)
+		return nil
+	}
+
+	globalDropDb = func(ctx context.Context, ksName string) error {
+		if err := vtcombo.DeleteKs(ctx, ts, ksName, mysqld, &tpb); err != nil {
+			return err
+		}
+
+		// Rebuild the SrvVSchema object
+		if err := ts.RebuildSrvVSchema(ctx, tpb.Cells); err != nil {
+			return err
+		}
+
+		return nil
+	}
+
 	// Now that we have fully initialized the tablets, rebuild the keyspace graph.
 	for _, ks := range tpb.Keyspaces {
-		err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, ks.GetName(), tpb.Cells)
+		err := topotools.RebuildKeyspace(context.Background(), logutil.NewConsoleLogger(), ts, ks.GetName(), tpb.Cells, false)
 		if err != nil {
 			if *startMysql {
 				mysqld.Shutdown(context.TODO(), cnf, true)
@@ -179,7 +237,7 @@ func main() {
 	// vtgate configuration and init
 	resilientServer = srvtopo.NewResilientServer(ts, "ResilientSrvTopoServer")
 	tabletTypesToWait := []topodatapb.TabletType{
-		topodatapb.TabletType_MASTER,
+		topodatapb.TabletType_PRIMARY,
 		topodatapb.TabletType_REPLICA,
 		topodatapb.TabletType_RDONLY,
 	}
@@ -187,10 +245,14 @@ func main() {
 	vtgate.QueryLogHandler = "/debug/vtgate/querylog"
 	vtgate.QueryLogzHandler = "/debug/vtgate/querylogz"
 	vtgate.QueryzHandler = "/debug/vtgate/queryz"
-	vtg := vtgate.Init(context.Background(), resilientServer, tpb.Cells[0], tabletTypesToWait)
+	// pass nil for healthcheck, it will get created
+	vtg := vtgate.Init(context.Background(), nil, resilientServer, tpb.Cells[0], tabletTypesToWait)
 
 	// vtctld configuration and init
-	vtctld.InitVtctld(ts)
+	err = vtctld.InitVtctld(ts)
+	if err != nil {
+		exit.Return(1)
+	}
 
 	servenv.OnRun(func() {
 		addStatusParts(vtg)

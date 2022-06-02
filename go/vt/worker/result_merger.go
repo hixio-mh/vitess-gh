@@ -21,8 +21,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
+	"google.golang.org/protobuf/proto"
+
+	"context"
 
 	"vitess.io/vitess/go/vt/proto/vtrpc"
 	"vitess.io/vitess/go/vt/vterrors"
@@ -73,7 +74,7 @@ func NewResultMerger(inputs []ResultReader, pkFieldCount int) (*ResultMerger, er
 
 	err := CheckValidTypesForResultMerger(fields, pkFieldCount)
 	if err != nil {
-		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "invalid PK types for ResultMerger. Use the vtworker LegacySplitClone command instead. %v", err.Error())
+		return nil, vterrors.Errorf(vtrpc.Code_FAILED_PRECONDITION, "invalid PK types for ResultMerger. Use the vtworker SplitClone command instead. %v", err.Error())
 	}
 
 	// Initialize the priority queue with all input ResultReader which have at
@@ -172,9 +173,8 @@ func (rm *ResultMerger) Next() (*sqltypes.Result, error) {
 	}
 
 	result := &sqltypes.Result{
-		Fields:       rm.fields,
-		RowsAffected: uint64(len(rm.output)),
-		Rows:         rm.output,
+		Fields: rm.fields,
+		Rows:   rm.output,
 	}
 	rm.reset()
 
@@ -295,13 +295,13 @@ func (h nextRowHeap) Swap(i, j int) {
 
 // Push adds x as element Len().
 // It is part of the container/heap.Interface interface.
-func (h *nextRowHeap) Push(x interface{}) {
+func (h *nextRowHeap) Push(x any) {
 	h.nextRowByInputs = append(h.nextRowByInputs, x.(*nextRow))
 }
 
 // Push removes and returns element Len()-1.
 // It is part of the container/heap.Interface interface.
-func (h *nextRowHeap) Pop() interface{} {
+func (h *nextRowHeap) Pop() any {
 	old := h.nextRowByInputs
 	n := len(old)
 	x := old[n-1]

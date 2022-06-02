@@ -43,6 +43,8 @@ limitations under the License.
 syntax = "proto3";
 option go_package = "vitess.io/vitess/go/vt/proto/vttest";
 
+import "vschema.proto";
+
 package vttest;
 
 // Shard describes a single shard in a keyspace.
@@ -75,7 +77,7 @@ message Keyspace {
   // redirects all traffic to another keyspace. If set, shards is ignored.
   string served_from = 5;
 
-  // number of replica tablets to instantiate. This includes the master tablet.
+  // number of replica tablets to instantiate. This includes the primary tablet.
   int32 replica_count = 6;
 
   // number of rdonly tablets to instantiate.
@@ -89,4 +91,7 @@ message VTTestTopology {
 
   // list of cells the keyspaces reside in. Vtgate is started in only the first cell.
   repeated string cells = 2;
+
+  // routing rules for the topology.
+  vschema.RoutingRules routing_rules = 3;
 }

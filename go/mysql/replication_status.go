@@ -30,40 +30,66 @@ type ReplicationStatus struct {
 	// were to finish executing everything that's currently in its relay log.
 	// However, some MySQL flavors don't expose this information,
 	// in which case RelayLogPosition.IsZero() will be true.
-	RelayLogPosition     Position
-	FilePosition         Position
-	FileRelayLogPosition Position
-	MasterServerID       uint
-	IOThreadRunning      bool
-	SQLThreadRunning     bool
-	SecondsBehindMaster  uint
-	MasterHost           string
-	MasterPort           int
-	MasterConnectRetry   int
-	MasterUUID           SID
+	// If ReplicationLagUnknown is true then we should not rely on the seconds
+	// behind value and we can instead try to calculate the lag ourselves when
+	// appropriate.
+	RelayLogPosition      Position
+	FilePosition          Position
+	FileRelayLogPosition  Position
+	SourceServerID        uint
+	IOState               ReplicationState
+	LastIOError           string
+	SQLState              ReplicationState
+	LastSQLError          string
+	ReplicationLagSeconds uint
+	ReplicationLagUnknown bool
+	SourceHost            string
+	SourcePort            int
+	ConnectRetry          int
+	SourceUUID            SID
 }
 
-// ReplicationRunning returns true iff both the IO and SQL threads are
-// running.
-func (s *ReplicationStatus) ReplicationRunning() bool {
-	return s.IOThreadRunning && s.SQLThreadRunning
+// Running returns true if both the IO and SQL threads are running.
+func (s *ReplicationStatus) Running() bool {
+	return s.IOState == ReplicationStateRunning && s.SQLState == ReplicationStateRunning
+}
+
+// Healthy returns true if both the SQL IO components are healthy
+func (s *ReplicationStatus) Healthy() bool {
+	return s.SQLHealthy() && s.IOHealthy()
+}
+
+// IOHealthy returns true if the IO thread is running OR, the
+// IO thread is connecting AND there's no IO error from the last
+// attempt to connect to the source.
+func (s *ReplicationStatus) IOHealthy() bool {
+	return s.IOState == ReplicationStateRunning ||
+		(s.IOState == ReplicationStateConnecting && s.LastIOError == "")
+}
+
+// SQLHealthy returns true if the SQLState is running.
+// For consistency and to support altering this calculation in the future.
+func (s *ReplicationStatus) SQLHealthy() bool {
+	return s.SQLState == ReplicationStateRunning
 }
 
 // ReplicationStatusToProto translates a Status to proto3.
 func ReplicationStatusToProto(s ReplicationStatus) *replicationdatapb.Status {
 	return &replicationdatapb.Status{
-		Position:             EncodePosition(s.Position),
-		RelayLogPosition:     EncodePosition(s.RelayLogPosition),
-		FilePosition:         EncodePosition(s.FilePosition),
-		FileRelayLogPosition: EncodePosition(s.FileRelayLogPosition),
-		MasterServerId:       uint32(s.MasterServerID),
-		IoThreadRunning:      s.IOThreadRunning,
-		SqlThreadRunning:     s.SQLThreadRunning,
-		SecondsBehindMaster:  uint32(s.SecondsBehindMaster),
-		MasterHost:           s.MasterHost,
-		MasterPort:           int32(s.MasterPort),
-		MasterConnectRetry:   int32(s.MasterConnectRetry),
-		MasterUuid:           s.MasterUUID.String(),
+		Position:              EncodePosition(s.Position),
+		RelayLogPosition:      EncodePosition(s.RelayLogPosition),
+		FilePosition:          EncodePosition(s.FilePosition),
+		FileRelayLogPosition:  EncodePosition(s.FileRelayLogPosition),
+		SourceServerId:        uint32(s.SourceServerID),
+		ReplicationLagSeconds: uint32(s.ReplicationLagSeconds),
+		SourceHost:            s.SourceHost,
+		SourcePort:            int32(s.SourcePort),
+		ConnectRetry:          int32(s.ConnectRetry),
+		SourceUuid:            s.SourceUUID.String(),
+		IoState:               int32(s.IOState),
+		LastIoError:           s.LastIOError,
+		SqlState:              int32(s.SQLState),
+		LastSqlError:          s.LastSQLError,
 	}
 }
 
@@ -86,25 +112,27 @@ func ProtoToReplicationStatus(s *replicationdatapb.Status) ReplicationStatus {
 		panic(vterrors.Wrapf(err, "cannot decode FileRelayLogPosition"))
 	}
 	var sid SID
-	if s.MasterUuid != "" {
-		sid, err = ParseSID(s.MasterUuid)
+	if s.SourceUuid != "" {
+		sid, err = ParseSID(s.SourceUuid)
 		if err != nil {
-			panic(vterrors.Wrapf(err, "cannot decode MasterUUID"))
+			panic(vterrors.Wrapf(err, "cannot decode SourceUUID"))
 		}
 	}
 	return ReplicationStatus{
-		Position:             pos,
-		RelayLogPosition:     relayPos,
-		FilePosition:         filePos,
-		FileRelayLogPosition: fileRelayPos,
-		MasterServerID:       uint(s.MasterServerId),
-		IOThreadRunning:      s.IoThreadRunning,
-		SQLThreadRunning:     s.SqlThreadRunning,
-		SecondsBehindMaster:  uint(s.SecondsBehindMaster),
-		MasterHost:           s.MasterHost,
-		MasterPort:           int(s.MasterPort),
-		MasterConnectRetry:   int(s.MasterConnectRetry),
-		MasterUUID:           sid,
+		Position:              pos,
+		RelayLogPosition:      relayPos,
+		FilePosition:          filePos,
+		FileRelayLogPosition:  fileRelayPos,
+		SourceServerID:        uint(s.SourceServerId),
+		ReplicationLagSeconds: uint(s.ReplicationLagSeconds),
+		SourceHost:            s.SourceHost,
+		SourcePort:            int(s.SourcePort),
+		ConnectRetry:          int(s.ConnectRetry),
+		SourceUUID:            sid,
+		IOState:               ReplicationState(s.IoState),
+		LastIOError:           s.LastIoError,
+		SQLState:              ReplicationState(s.SqlState),
+		LastSQLError:          s.LastSqlError,
 	}
 }
 
@@ -112,7 +140,7 @@ func ProtoToReplicationStatus(s *replicationdatapb.Status) ReplicationStatus {
 // provided as a list of ReplicationStatus's. This method only works if the flavor for all retrieved ReplicationStatus's is MySQL.
 // The result is returned as a Mysql56GTIDSet, each of whose elements is a found errant GTID.
 func (s *ReplicationStatus) FindErrantGTIDs(otherReplicaStatuses []*ReplicationStatus) (Mysql56GTIDSet, error) {
-	set, ok := s.RelayLogPosition.GTIDSet.(Mysql56GTIDSet)
+	relayLogSet, ok := s.RelayLogPosition.GTIDSet.(Mysql56GTIDSet)
 	if !ok {
 		return nil, fmt.Errorf("errant GTIDs can only be computed on the MySQL flavor")
 	}
@@ -123,22 +151,13 @@ func (s *ReplicationStatus) FindErrantGTIDs(otherReplicaStatuses []*ReplicationS
 		if !ok {
 			panic("The receiver ReplicationStatus contained a Mysql56GTIDSet in its relay log, but a replica's ReplicationStatus is of another flavor. This should never happen.")
 		}
-		// Copy and throw out master SID from consideration, so we don't mutate input.
-		otherSetNoMasterSID := make(Mysql56GTIDSet, len(otherSet))
-		for sid, intervals := range otherSet {
-			if sid == status.MasterUUID {
-				continue
-			}
-			otherSetNoMasterSID[sid] = intervals
-		}
-
-		otherSets = append(otherSets, otherSetNoMasterSID)
+		otherSets = append(otherSets, otherSet)
 	}
 
 	// Copy set for final diffSet so we don't mutate receiver.
-	diffSet := make(Mysql56GTIDSet, len(set))
-	for sid, intervals := range set {
-		if sid == s.MasterUUID {
+	diffSet := make(Mysql56GTIDSet, len(relayLogSet))
+	for sid, intervals := range relayLogSet {
+		if sid == s.SourceUUID {
 			continue
 		}
 		diffSet[sid] = intervals

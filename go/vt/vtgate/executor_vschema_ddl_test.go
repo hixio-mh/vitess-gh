@@ -33,6 +33,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	vschemapb "vitess.io/vitess/go/vt/proto/vschema"
 	vtgatepb "vitess.io/vitess/go/vt/proto/vtgate"
 )
@@ -57,14 +58,14 @@ func waitForVindex(t *testing.T, ks, name string, watch chan *vschemapb.SrvVSche
 		t.Errorf("vschema was not updated as expected")
 	}
 
-	// Wait up to 10ms until the vindex manager gets notified of the update
+	// Wait up to 100ms until the vindex manager gets notified of the update
 	for i := 0; i < 10; i++ {
 		vschema := executor.vm.GetCurrentSrvVschema()
 		vindex, ok := vschema.Keyspaces[ks].Vindexes[name]
 		if ok {
 			return vschema, vindex
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	t.Fatalf("updated vschema did not contain %s", name)
@@ -74,7 +75,7 @@ func waitForVindex(t *testing.T, ks, name string, watch chan *vschemapb.SrvVSche
 func waitForVschemaTables(t *testing.T, ks string, tables []string, executor *Executor) *vschemapb.SrvVSchema {
 	t.Helper()
 
-	// Wait up to 10ms until the vindex manager gets notified of the update
+	// Wait up to 100ms until the vindex manager gets notified of the update
 	for i := 0; i < 10; i++ {
 		vschema := executor.vm.GetCurrentSrvVschema()
 		gotTables := []string{}
@@ -86,7 +87,7 @@ func waitForVschemaTables(t *testing.T, ks string, tables []string, executor *Ex
 		if reflect.DeepEqual(tables, gotTables) {
 			return vschema
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	t.Fatalf("updated vschema did not contain tables %v", tables)
@@ -133,12 +134,13 @@ func TestPlanExecutorAlterVSchemaKeyspace(t *testing.T) {
 	defer func() {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
-	executor, _, _, _ := createLegacyExecutorEnv()
-	session := NewSafeSession(&vtgatepb.Session{TargetString: "@master", Autocommit: true})
+	executor, _, _, _ := createExecutorEnv()
+	session := NewSafeSession(&vtgatepb.Session{TargetString: "@primary", Autocommit: true})
 
 	vschemaUpdates := make(chan *vschemapb.SrvVSchema, 2)
-	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) {
+	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) bool {
 		vschemaUpdates <- vschema
+		return true
 	})
 
 	vschema := <-vschemaUpdates
@@ -160,12 +162,13 @@ func TestPlanExecutorCreateVindexDDL(t *testing.T) {
 	defer func() {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
-	executor, _, _, _ := createLegacyExecutorEnv()
+	executor, _, _, _ := createExecutorEnv()
 	ks := "TestExecutor"
 
 	vschemaUpdates := make(chan *vschemapb.SrvVSchema, 4)
-	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) {
+	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) bool {
 		vschemaUpdates <- vschema
+		return true
 	})
 
 	vschema := <-vschemaUpdates
@@ -201,12 +204,13 @@ func TestPlanExecutorDropVindexDDL(t *testing.T) {
 	defer func() {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
-	executor, _, _, _ := createLegacyExecutorEnv()
+	executor, _, _, _ := createExecutorEnv()
 	ks := "TestExecutor"
 
 	vschemaUpdates := make(chan *vschemapb.SrvVSchema, 4)
-	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) {
+	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) bool {
 		vschemaUpdates <- vschema
+		return true
 	})
 
 	vschema := <-vschemaUpdates
@@ -269,12 +273,13 @@ func TestPlanExecutorAddDropVschemaTableDDL(t *testing.T) {
 	defer func() {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
-	executor, sbc1, sbc2, sbclookup := createLegacyExecutorEnv()
+	executor, sbc1, sbc2, sbclookup := createExecutorEnv()
 	ks := KsTestUnsharded
 
 	vschemaUpdates := make(chan *vschemapb.SrvVSchema, 4)
-	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) {
+	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) bool {
 		vschemaUpdates <- vschema
+		return true
 	})
 
 	vschema := <-vschemaUpdates
@@ -292,12 +297,12 @@ func TestPlanExecutorAddDropVschemaTableDDL(t *testing.T) {
 	stmt := "alter vschema add table test_table"
 	_, err := executor.Execute(context.Background(), "TestExecute", session, stmt, nil)
 	require.NoError(t, err)
-	_ = waitForVschemaTables(t, ks, append(vschemaTables, "test_table"), executor)
+	_ = waitForVschemaTables(t, ks, append([]string{"test_table"}, vschemaTables...), executor)
 
 	stmt = "alter vschema add table test_table2"
 	_, err = executor.Execute(context.Background(), "TestExecute", session, stmt, nil)
 	require.NoError(t, err)
-	_ = waitForVschemaTables(t, ks, append(vschemaTables, []string{"test_table", "test_table2"}...), executor)
+	_ = waitForVschemaTables(t, ks, append([]string{"test_table", "test_table2"}, vschemaTables...), executor)
 
 	// Should fail adding a table on a sharded keyspace
 	session = NewSafeSession(&vtgatepb.Session{TargetString: "TestExecutor"})
@@ -325,7 +330,7 @@ func TestExecutorAddSequenceDDL(t *testing.T) {
 	defer func() {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
-	executor, _, _, _ := createLegacyExecutorEnv()
+	executor, _, _, _ := createExecutorEnv()
 	ks := KsTestUnsharded
 
 	vschema := executor.vm.GetCurrentSrvVschema()
@@ -385,12 +390,13 @@ func TestExecutorAddDropVindexDDL(t *testing.T) {
 	defer func() {
 		*vschemaacl.AuthorizedDDLUsers = ""
 	}()
-	executor, sbc1, sbc2, sbclookup := createLegacyExecutorEnv() //nolint
+	executor, sbc1, sbc2, sbclookup := createExecutorEnv() //nolint
 	ks := "TestExecutor"
 	session := NewSafeSession(&vtgatepb.Session{TargetString: ks})
 	vschemaUpdates := make(chan *vschemapb.SrvVSchema, 4)
-	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) {
+	executor.serv.WatchSrvVSchema(context.Background(), "aa", func(vschema *vschemapb.SrvVSchema, err error) bool {
 		vschemaUpdates <- vschema
+		return true
 	})
 
 	vschema := <-vschemaUpdates
@@ -715,7 +721,7 @@ func TestExecutorAddDropVindexDDL(t *testing.T) {
 
 func TestPlanExecutorVindexDDLACL(t *testing.T) {
 	//t.Skip("not yet planned")
-	executor, _, _, _ := createLegacyExecutorEnv()
+	executor, _, _, _ := createExecutorEnv()
 	ks := "TestExecutor"
 	session := NewSafeSession(&vtgatepb.Session{TargetString: ks})
 
@@ -724,16 +730,11 @@ func TestPlanExecutorVindexDDLACL(t *testing.T) {
 
 	// test that by default no users can perform the operation
 	stmt := "alter vschema create vindex test_hash using hash"
-	authErr := "not authorized to perform vschema operations"
 	_, err := executor.Execute(ctxRedUser, "TestExecute", session, stmt, nil)
-	if err == nil || err.Error() != authErr {
-		t.Errorf("expected error '%s' got '%v'", authErr, err)
-	}
+	require.EqualError(t, err, `User 'redUser' is not authorized to perform vschema operations`)
 
 	_, err = executor.Execute(ctxBlueUser, "TestExecute", session, stmt, nil)
-	if err == nil || err.Error() != authErr {
-		t.Errorf("expected error '%s' got '%v'", authErr, err)
-	}
+	require.EqualError(t, err, `User 'blueUser' is not authorized to perform vschema operations`)
 
 	// test when all users are enabled
 	*vschemaacl.AuthorizedDDLUsers = "%"
@@ -752,9 +753,8 @@ func TestPlanExecutorVindexDDLACL(t *testing.T) {
 	*vschemaacl.AuthorizedDDLUsers = "orangeUser, blueUser, greenUser"
 	vschemaacl.Init()
 	_, err = executor.Execute(ctxRedUser, "TestExecute", session, stmt, nil)
-	if err == nil || err.Error() != authErr {
-		t.Errorf("expected error '%s' got '%v'", authErr, err)
-	}
+	require.EqualError(t, err, `User 'redUser' is not authorized to perform vschema operations`)
+
 	stmt = "alter vschema create vindex test_hash3 using hash"
 	_, err = executor.Execute(ctxBlueUser, "TestExecute", session, stmt, nil)
 	if err != nil {

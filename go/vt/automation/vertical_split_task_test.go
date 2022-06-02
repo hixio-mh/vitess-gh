@@ -20,7 +20,7 @@ import (
 	"flag"
 	"testing"
 
-	"golang.org/x/net/context"
+	"context"
 
 	automationpb "vitess.io/vitess/go/vt/proto/automation"
 	"vitess.io/vitess/go/vt/vtctl/fakevtctlclient"
@@ -50,7 +50,7 @@ func TestVerticalSplitTask(t *testing.T) {
 	vtworker.RegisterResult([]string{"VerticalSplitDiff", "--min_healthy_rdonly_tablets=1", "destination_keyspace/0"}, "", nil)
 	vtctld.RegisterResult([]string{"MigrateServedFrom", "destination_keyspace/0", "rdonly"}, "", nil)
 	vtctld.RegisterResult([]string{"MigrateServedFrom", "destination_keyspace/0", "replica"}, "", nil)
-	vtctld.RegisterResult([]string{"MigrateServedFrom", "destination_keyspace/0", "master"},
+	vtctld.RegisterResult([]string{"MigrateServedFrom", "destination_keyspace/0", "primary"},
 		"ALL_DONE",
 		nil)
 

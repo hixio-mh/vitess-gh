@@ -19,7 +19,7 @@ package cluster
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"vitess.io/vitess/go/vt/log"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder"
+	"vitess.io/vitess/go/vt/vtgate/planbuilder/plancontext"
 )
 
 // VtgateProcess is a generic handle for a running vtgate .
@@ -48,48 +50,53 @@ type VtgateProcess struct {
 	Cell                  string
 	CellsToWatch          string
 	TabletTypesToWait     string
-	GatewayImplementation string
 	ServiceMap            string
 	MySQLAuthServerImpl   string
 	Directory             string
 	VerifyURL             string
+	VSchemaURL            string
 	SysVarSetEnabled      bool
-	//Extra Args to be set before starting the vtgate process
+	PlannerVersion        plancontext.PlannerVersion
+	// Extra Args to be set before starting the vtgate process
 	ExtraArgs []string
 
 	proc *exec.Cmd
 	exit chan error
 }
 
+const defaultVtGatePlannerVersion = planbuilder.Gen4CompareV3
+
 // Setup starts Vtgate process with required arguements
 func (vtgate *VtgateProcess) Setup() (err error) {
 
 	args := []string{
-		"-topo_implementation", vtgate.CommonArg.TopoImplementation,
-		"-topo_global_server_address", vtgate.CommonArg.TopoGlobalAddress,
-		"-topo_global_root", vtgate.CommonArg.TopoGlobalRoot,
-		"-log_dir", vtgate.LogDir,
-		"-log_queries_to_file", vtgate.FileToLogQueries,
-		"-port", fmt.Sprintf("%d", vtgate.Port),
-		"-grpc_port", fmt.Sprintf("%d", vtgate.GrpcPort),
-		"-mysql_server_port", fmt.Sprintf("%d", vtgate.MySQLServerPort),
-		"-mysql_server_socket_path", vtgate.MySQLServerSocketPath,
-		"-cell", vtgate.Cell,
-		"-cells_to_watch", vtgate.CellsToWatch,
-		"-tablet_types_to_wait", vtgate.TabletTypesToWait,
-		"-gateway_implementation", vtgate.GatewayImplementation,
-		"-service_map", vtgate.ServiceMap,
-		"-mysql_auth_server_impl", vtgate.MySQLAuthServerImpl,
+		"--topo_implementation", vtgate.CommonArg.TopoImplementation,
+		"--topo_global_server_address", vtgate.CommonArg.TopoGlobalAddress,
+		"--topo_global_root", vtgate.CommonArg.TopoGlobalRoot,
+		"--log_dir", vtgate.LogDir,
+		"--log_queries_to_file", vtgate.FileToLogQueries,
+		"--port", fmt.Sprintf("%d", vtgate.Port),
+		"--grpc_port", fmt.Sprintf("%d", vtgate.GrpcPort),
+		"--mysql_server_port", fmt.Sprintf("%d", vtgate.MySQLServerPort),
+		"--mysql_server_socket_path", vtgate.MySQLServerSocketPath,
+		"--cell", vtgate.Cell,
+		"--cells_to_watch", vtgate.CellsToWatch,
+		"--tablet_types_to_wait", vtgate.TabletTypesToWait,
+		"--service_map", vtgate.ServiceMap,
+		"--mysql_auth_server_impl", vtgate.MySQLAuthServerImpl,
+	}
+	if vtgate.PlannerVersion > 0 {
+		args = append(args, "--planner_version", vtgate.PlannerVersion.String())
 	}
 	if vtgate.SysVarSetEnabled {
-		args = append(args, "-enable_system_settings")
+		args = append(args, "--enable_system_settings")
 	}
 	vtgate.proc = exec.Command(
 		vtgate.Binary,
 		args...,
 	)
 	if *isCoverage {
-		vtgate.proc.Args = append(vtgate.proc.Args, "-test.coverprofile="+getCoveragePath("vtgate.out"))
+		vtgate.proc.Args = append(vtgate.proc.Args, "--test.coverprofile="+getCoveragePath("vtgate.out"))
 	}
 
 	vtgate.proc.Args = append(vtgate.proc.Args, vtgate.ExtraArgs...)
@@ -148,14 +155,13 @@ func (vtgate *VtgateProcess) GetStatusForTabletOfShard(name string, endPointsCou
 		return false
 	}
 	if resp.StatusCode == 200 {
-		resultMap := make(map[string]interface{})
-		respByte, _ := ioutil.ReadAll(resp.Body)
+		resultMap := make(map[string]any)
+		respByte, _ := io.ReadAll(resp.Body)
 		err := json.Unmarshal(respByte, &resultMap)
 		if err != nil {
 			panic(err)
 		}
 		object := reflect.ValueOf(resultMap["HealthcheckConnections"])
-		masterConnectionExist := false
 		if object.Kind() == reflect.Map {
 			for _, key := range object.MapKeys() {
 				if key.String() == name {
@@ -165,7 +171,6 @@ func (vtgate *VtgateProcess) GetStatusForTabletOfShard(name string, endPointsCou
 				}
 			}
 		}
-		return masterConnectionExist
 	}
 	return false
 }
@@ -173,7 +178,7 @@ func (vtgate *VtgateProcess) GetStatusForTabletOfShard(name string, endPointsCou
 // WaitForStatusOfTabletInShard function waits till status of a tablet in shard is 1
 // endPointsCount: how many endpoints to wait for
 func (vtgate *VtgateProcess) WaitForStatusOfTabletInShard(name string, endPointsCount int) error {
-	timeout := time.Now().Add(10 * time.Second)
+	timeout := time.Now().Add(15 * time.Second)
 	for time.Now().Before(timeout) {
 		if vtgate.GetStatusForTabletOfShard(name, endPointsCount) {
 			return nil
@@ -193,6 +198,7 @@ func (vtgate *VtgateProcess) TearDown() error {
 	if vtgate.proc == nil || vtgate.exit == nil {
 		return nil
 	}
+	// graceful shutdown is not currently working with vtgate, attempting a force-kill to make tests less flaky
 	// Attempt graceful shutdown with SIGTERM first
 	vtgate.proc.Process.Signal(syscall.SIGTERM)
 
@@ -203,7 +209,7 @@ func (vtgate *VtgateProcess) TearDown() error {
 		vtgate.proc = nil
 		return nil
 
-	case <-time.After(10 * time.Second):
+	case <-time.After(30 * time.Second):
 		vtgate.proc.Process.Kill()
 		vtgate.proc = nil
 		return <-vtgate.exit
@@ -213,7 +219,14 @@ func (vtgate *VtgateProcess) TearDown() error {
 // VtgateProcessInstance returns a Vtgate handle for vtgate process
 // configured with the given Config.
 // The process must be manually started by calling setup()
-func VtgateProcessInstance(port int, grpcPort int, mySQLServerPort int, cell string, cellsToWatch string, hostname string, tabletTypesToWait string, topoPort int, tmpDirectory string, extraArgs []string) *VtgateProcess {
+func VtgateProcessInstance(
+	port, grpcPort, mySQLServerPort int,
+	cell, cellsToWatch, hostname, tabletTypesToWait string,
+	topoPort int,
+	tmpDirectory string,
+	extraArgs []string,
+	plannerVersion plancontext.PlannerVersion,
+) *VtgateProcess {
 	vtctl := VtctlProcessInstance(topoPort, hostname)
 	vtgate := &VtgateProcess{
 		Name:                  "vtgate",
@@ -229,26 +242,27 @@ func VtgateProcessInstance(port int, grpcPort int, mySQLServerPort int, cell str
 		Cell:                  cell,
 		CellsToWatch:          cellsToWatch,
 		TabletTypesToWait:     tabletTypesToWait,
-		GatewayImplementation: "tabletgateway",
 		CommonArg:             *vtctl,
 		MySQLAuthServerImpl:   "none",
 		ExtraArgs:             extraArgs,
+		PlannerVersion:        plannerVersion,
 	}
 
 	vtgate.VerifyURL = fmt.Sprintf("http://%s:%d/debug/vars", hostname, port)
+	vtgate.VSchemaURL = fmt.Sprintf("http://%s:%d/debug/vschema", hostname, port)
 
 	return vtgate
 }
 
 // GetVars returns map of vars
-func (vtgate *VtgateProcess) GetVars() (map[string]interface{}, error) {
-	resultMap := make(map[string]interface{})
+func (vtgate *VtgateProcess) GetVars() (map[string]any, error) {
+	resultMap := make(map[string]any)
 	resp, err := http.Get(vtgate.VerifyURL)
 	if err != nil {
 		return nil, fmt.Errorf("error getting response from %s", vtgate.VerifyURL)
 	}
 	if resp.StatusCode == 200 {
-		respByte, _ := ioutil.ReadAll(resp.Body)
+		respByte, _ := io.ReadAll(resp.Body)
 		err := json.Unmarshal(respByte, &resultMap)
 		if err != nil {
 			return nil, fmt.Errorf("not able to parse response body")

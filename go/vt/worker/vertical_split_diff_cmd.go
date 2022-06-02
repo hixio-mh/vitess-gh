@@ -26,7 +26,8 @@ import (
 
 	"vitess.io/vitess/go/vt/vterrors"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/concurrency"
 	"vitess.io/vitess/go/vt/topo/topoproto"
 	"vitess.io/vitess/go/vt/wrangler"
@@ -158,7 +159,7 @@ func shardsWithTablesSources(ctx context.Context, wr *wrangler.Wrangler) ([]map[
 	return result, nil
 }
 
-func interactiveVerticalSplitDiff(ctx context.Context, wi *Instance, wr *wrangler.Wrangler, w http.ResponseWriter, r *http.Request) (Worker, *template.Template, map[string]interface{}, error) {
+func interactiveVerticalSplitDiff(ctx context.Context, wi *Instance, wr *wrangler.Wrangler, w http.ResponseWriter, r *http.Request) (Worker, *template.Template, map[string]any, error) {
 	if err := r.ParseForm(); err != nil {
 		return nil, nil, nil, vterrors.Wrap(err, "cannot parse form")
 	}
@@ -167,7 +168,7 @@ func interactiveVerticalSplitDiff(ctx context.Context, wi *Instance, wr *wrangle
 
 	if keyspace == "" || shard == "" {
 		// display the list of possible shards to chose from
-		result := make(map[string]interface{})
+		result := make(map[string]any)
 		shards, err := shardsWithTablesSources(ctx, wr)
 		if err != nil {
 			result["Error"] = err.Error()
@@ -180,7 +181,7 @@ func interactiveVerticalSplitDiff(ctx context.Context, wi *Instance, wr *wrangle
 	submitButtonValue := r.FormValue("submit")
 	if submitButtonValue == "" {
 		// display the input form
-		result := make(map[string]interface{})
+		result := make(map[string]any)
 		result["Keyspace"] = keyspace
 		result["Shard"] = shard
 		result["DefaultMinHealthyRdonlyTablets"] = fmt.Sprintf("%v", defaultMinHealthyTablets)

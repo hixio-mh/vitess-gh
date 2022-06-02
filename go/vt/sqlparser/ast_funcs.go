@@ -17,9 +17,16 @@ limitations under the License.
 package sqlparser
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
+
+	vtrpcpb "vitess.io/vitess/go/vt/proto/vtrpc"
+	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/log"
 
@@ -33,27 +40,7 @@ import (
 // is interrupted, and the error is returned.
 func Walk(visit Visit, nodes ...SQLNode) error {
 	for _, node := range nodes {
-		if node == nil {
-			continue
-		}
-		var err error
-		var kontinue bool
-		pre := func(cursor *Cursor) bool {
-			// If we already have found an error, don't visit these nodes, just exit early
-			if err != nil {
-				return false
-			}
-			kontinue, err = visit(cursor.Node())
-			if err != nil {
-				return true // we have to return true here so that post gets called
-			}
-			return kontinue
-		}
-		post := func(cursor *Cursor) bool {
-			return err == nil // now we can abort the traversal if an error was found
-		}
-
-		Rewrite(node, pre, post)
+		err := VisitSQLNode(node, visit)
 		if err != nil {
 			return err
 		}
@@ -63,20 +50,24 @@ func Walk(visit Visit, nodes ...SQLNode) error {
 
 // Visit defines the signature of a function that
 // can be used to visit all nodes of a parse tree.
+// returning false on kontinue means that children will not be visited
+// returning an error will abort the visitation and return the error
 type Visit func(node SQLNode) (kontinue bool, err error)
 
 // Append appends the SQLNode to the buffer.
 func Append(buf *strings.Builder, node SQLNode) {
 	tbuf := &TrackedBuffer{
 		Builder: buf,
+		fast:    true,
 	}
-	node.Format(tbuf)
+	node.formatFast(tbuf)
 }
 
 // IndexColumn describes a column in an index definition with optional length
 type IndexColumn struct {
-	Column ColIdent
-	Length *Literal
+	Column    ColIdent
+	Length    *Literal
+	Direction OrderDirection
 }
 
 // LengthScaleOption is used for types that have an optional length
@@ -86,11 +77,20 @@ type LengthScaleOption struct {
 	Scale  *Literal
 }
 
-// IndexOption is used for trailing options for indexes: COMMENT, KEY_BLOCK_SIZE, USING
+// IndexOption is used for trailing options for indexes: COMMENT, KEY_BLOCK_SIZE, USING, WITH PARSER
 type IndexOption struct {
-	Name  string
-	Value *Literal
-	Using string
+	Name   string
+	Value  *Literal
+	String string
+}
+
+// TableOption is used for create table options like AUTO_INCREMENT, INSERT_METHOD, etc
+type TableOption struct {
+	Name          string
+	Value         *Literal
+	String        string
+	Tables        TableNames
+	CaseSensitive bool
 }
 
 // ColumnKeyOption indicates whether or not the given column is defined as an
@@ -101,6 +101,7 @@ const (
 	colKeyNone ColumnKeyOption = iota
 	colKeyPrimary
 	colKeySpatialKey
+	colKeyFulltextKey
 	colKeyUnique
 	colKeyUniqueKey
 	colKey
@@ -140,22 +141,15 @@ type ValType int
 const (
 	StrVal = ValType(iota)
 	IntVal
+	DecimalVal
 	FloatVal
 	HexNum
 	HexVal
 	BitVal
 )
 
-// AffectedTables returns the list table names affected by the DDL.
-func (node *DDL) AffectedTables() TableNames {
-	if node.Action == RenameStr || node.Action == DropStr {
-		list := make(TableNames, 0, len(node.FromTables)+len(node.ToTables))
-		list = append(list, node.FromTables...)
-		list = append(list, node.ToTables...)
-		return list
-	}
-	return TableNames{node.Table}
-}
+// queryOptimizerPrefix is the prefix of an optimizer hint comment.
+const queryOptimizerPrefix = "/*+"
 
 // AddColumn appends the given column to the list in the spec
 func (ts *TableSpec) AddColumn(cd *ColumnDefinition) {
@@ -291,7 +285,51 @@ func (ct *ColumnType) SQLType() querypb.Type {
 	case keywordStrings[MULTIPOLYGON]:
 		return sqltypes.Geometry
 	}
-	panic("unimplemented type " + ct.Type)
+	return sqltypes.Null
+}
+
+// AddQueryHint adds the given string to list of comment.
+// If the list is empty, one will be created containing the query hint.
+// If the list already contains a query hint, the given string will be merged with the existing one.
+// This is done because only one query hint is allowed per query.
+func (node *ParsedComments) AddQueryHint(queryHint string) (Comments, error) {
+	if queryHint == "" {
+		if node == nil {
+			return nil, nil
+		}
+		return node.comments, nil
+	}
+
+	var newComments Comments
+	var hasQueryHint bool
+
+	if node != nil {
+		for _, comment := range node.comments {
+			if strings.HasPrefix(comment, queryOptimizerPrefix) {
+				if hasQueryHint {
+					return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "Must have only one query hint")
+				}
+				hasQueryHint = true
+				idx := strings.Index(comment, "*/")
+				if idx == -1 {
+					return nil, vterrors.New(vtrpcpb.Code_INTERNAL, "Query hint comment is malformed")
+				}
+				if strings.Contains(comment, queryHint) {
+					newComments = append(Comments{comment}, newComments...)
+					continue
+				}
+				newComment := fmt.Sprintf("%s %s */", strings.TrimSpace(comment[:idx]), queryHint)
+				newComments = append(Comments{newComment}, newComments...)
+				continue
+			}
+			newComments = append(newComments, comment)
+		}
+	}
+	if !hasQueryHint {
+		queryHintCommentStr := fmt.Sprintf("%s %s */", queryOptimizerPrefix, queryHint)
+		newComments = append(Comments{queryHintCommentStr}, newComments...)
+	}
+	return newComments, nil
 }
 
 // ParseParams parses the vindex parameter list, pulling out the special-case
@@ -313,16 +351,9 @@ var _ ConstraintInfo = &ForeignKeyDefinition{}
 
 func (f *ForeignKeyDefinition) iConstraintInfo() {}
 
-// HasOnTable returns true if the show statement has an "on" clause
-func (node *Show) HasOnTable() bool {
-	return node.OnTable.Name.v != ""
-}
+var _ ConstraintInfo = &CheckConstraintDefinition{}
 
-// HasTable returns true if the show statement has a parsed table name.
-// Not all show statements parse table names.
-func (node *Show) HasTable() bool {
-	return node.Table.Name.v != ""
-}
+func (c *CheckConstraintDefinition) iConstraintInfo() {}
 
 // FindColumn finds a column in the column list, returning
 // the index if it exists or -1 otherwise
@@ -340,6 +371,20 @@ func (node *AliasedTableExpr) RemoveHints() *AliasedTableExpr {
 	noHints := *node
 	noHints.Hints = nil
 	return &noHints
+}
+
+// TableName returns a TableName pointing to this table expr
+func (node *AliasedTableExpr) TableName() (TableName, error) {
+	if !node.As.IsEmpty() {
+		return TableName{Name: node.As}, nil
+	}
+
+	tableName, ok := node.Expr.(TableName)
+	if !ok {
+		return TableName{}, vterrors.Errorf(vtrpcpb.Code_INTERNAL, "BUG: the AST has changed. This should not be possible")
+	}
+
+	return tableName, nil
 }
 
 // IsEmpty returns true if TableName is nil or empty.
@@ -360,7 +405,7 @@ func (node TableName) ToViewName() TableName {
 
 // NewWhere creates a WHERE or HAVING clause out
 // of a Expr. If the expression is nil, it returns nil.
-func NewWhere(typ string, expr Expr) *Where {
+func NewWhere(typ WhereType, expr Expr) *Where {
 	if expr == nil {
 		return nil
 	}
@@ -372,9 +417,10 @@ func NewWhere(typ string, expr Expr) *Where {
 // then to is returned.
 func ReplaceExpr(root, from, to Expr) Expr {
 	tmp := Rewrite(root, replaceExpr(from, to), nil)
+
 	expr, success := tmp.(Expr)
 	if !success {
-		log.Errorf("Failed to rewrite expression. Rewriter returned a non-expression: " + String(tmp))
+		log.Errorf("Failed to rewrite expression. Rewriter returned a non-expression:  %s", String(tmp))
 		return from
 	}
 
@@ -406,7 +452,7 @@ func (node *ComparisonExpr) IsImpossible() bool {
 	if right, ok = node.Right.(*Literal); !ok {
 		return false
 	}
-	if node.Operator == NotEqualStr && left.Type == right.Type {
+	if node.Operator == NotEqualOp && left.Type == right.Type {
 		if len(left.Val) != len(right.Val) {
 			return false
 		}
@@ -422,48 +468,88 @@ func (node *ComparisonExpr) IsImpossible() bool {
 }
 
 // NewStrLiteral builds a new StrVal.
-func NewStrLiteral(in []byte) *Literal {
+func NewStrLiteral(in string) *Literal {
 	return &Literal{Type: StrVal, Val: in}
 }
 
 // NewIntLiteral builds a new IntVal.
-func NewIntLiteral(in []byte) *Literal {
+func NewIntLiteral(in string) *Literal {
 	return &Literal{Type: IntVal, Val: in}
 }
 
+func NewDecimalLiteral(in string) *Literal {
+	return &Literal{Type: DecimalVal, Val: in}
+}
+
 // NewFloatLiteral builds a new FloatVal.
-func NewFloatLiteral(in []byte) *Literal {
+func NewFloatLiteral(in string) *Literal {
 	return &Literal{Type: FloatVal, Val: in}
 }
 
 // NewHexNumLiteral builds a new HexNum.
-func NewHexNumLiteral(in []byte) *Literal {
+func NewHexNumLiteral(in string) *Literal {
 	return &Literal{Type: HexNum, Val: in}
 }
 
 // NewHexLiteral builds a new HexVal.
-func NewHexLiteral(in []byte) *Literal {
+func NewHexLiteral(in string) *Literal {
 	return &Literal{Type: HexVal, Val: in}
 }
 
 // NewBitLiteral builds a new BitVal containing a bit literal.
-func NewBitLiteral(in []byte) *Literal {
+func NewBitLiteral(in string) *Literal {
 	return &Literal{Type: BitVal, Val: in}
 }
 
 // NewArgument builds a new ValArg.
-func NewArgument(in []byte) Argument {
-	return in
+func NewArgument(in string) Argument {
+	return Argument(in)
+}
+
+// NewListArg builds a new ListArg.
+func NewListArg(in string) ListArg {
+	return ListArg(in)
+}
+
+// String returns ListArg as a string.
+func (node ListArg) String() string {
+	return string(node)
+}
+
+// Bytes return the []byte
+func (node *Literal) Bytes() []byte {
+	return []byte(node.Val)
 }
 
 // HexDecode decodes the hexval into bytes.
 func (node *Literal) HexDecode() ([]byte, error) {
-	dst := make([]byte, hex.DecodedLen(len([]byte(node.Val))))
-	_, err := hex.Decode(dst, []byte(node.Val))
-	if err != nil {
-		return nil, err
+	return hex.DecodeString(node.Val)
+}
+
+// encodeHexValToMySQLQueryFormat encodes the hexval back into the query format
+// for passing on to MySQL as a bind var
+func (node *Literal) encodeHexValToMySQLQueryFormat() ([]byte, error) {
+	nb := node.Bytes()
+	if node.Type != HexVal {
+		return nb, vterrors.Errorf(vtrpcpb.Code_INVALID_ARGUMENT, "Literal value is not a HexVal")
 	}
-	return dst, err
+
+	// Let's make this idempotent in case it's called more than once
+	match, err := regexp.Match("^x'.*'$", nb)
+	if err != nil {
+		return nb, err
+	}
+	if match {
+		return nb, nil
+	}
+
+	var bb bytes.Buffer
+	bb.WriteByte('x')
+	bb.WriteByte('\'')
+	bb.WriteString(string(nb))
+	bb.WriteByte('\'')
+	nb = bb.Bytes()
+	return nb, nil
 }
 
 // Equal returns true if the column names match.
@@ -514,8 +600,19 @@ func NewColName(str string) *ColName {
 	}
 }
 
-//NewSelect is used to create a select statement
-func NewSelect(comments Comments, exprs SelectExprs, selectOptions []string, from TableExprs, where *Where, groupBy GroupBy, having *Where) *Select {
+// NewColNameWithQualifier makes a new ColName pointing to a specific table
+func NewColNameWithQualifier(identifier string, table TableName) *ColName {
+	return &ColName{
+		Name: NewColIdent(identifier),
+		Qualifier: TableName{
+			Name:      NewTableIdent(table.Name.String()),
+			Qualifier: NewTableIdent(table.Qualifier.String()),
+		},
+	}
+}
+
+// NewSelect is used to create a select statement
+func NewSelect(comments Comments, exprs SelectExprs, selectOptions []string, into *SelectInto, from TableExprs, where *Where, groupBy GroupBy, having *Where) *Select {
 	var cache *bool
 	var distinct, straightJoinHint, sqlFoundRows bool
 
@@ -537,11 +634,12 @@ func NewSelect(comments Comments, exprs SelectExprs, selectOptions []string, fro
 	}
 	return &Select{
 		Cache:            cache,
-		Comments:         comments,
+		Comments:         comments.Parsed(),
 		Distinct:         distinct,
 		StraightJoinHint: straightJoinHint,
 		SQLCalcFoundRows: sqlFoundRows,
 		SelectExprs:      exprs,
+		Into:             into,
 		From:             from,
 		Where:            where,
 		GroupBy:          groupBy,
@@ -621,7 +719,11 @@ func (node *ColIdent) UnmarshalJSON(b []byte) error {
 
 // NewTableIdent creates a new TableIdent.
 func NewTableIdent(str string) TableIdent {
-	return TableIdent{v: str}
+	// Use StringClone on the table name to ensure it is not pinned to the
+	// underlying query string that has been generated by the parser. This
+	// could lead to a significant increase in memory usage when the table
+	// name comes from a large query.
+	return TableIdent{v: strings.Clone(str)}
 }
 
 // IsEmpty returns true if TabIdent is empty.
@@ -662,11 +764,12 @@ func (node *TableIdent) UnmarshalJSON(b []byte) error {
 func containEscapableChars(s string, at AtCount) bool {
 	isDbSystemVariable := at != NoAt
 
-	for i, c := range s {
-		letter := isLetter(uint16(c))
-		systemVarChar := isDbSystemVariable && isCarat(uint16(c))
+	for i := range s {
+		c := uint16(s[i])
+		letter := isLetter(c)
+		systemVarChar := isDbSystemVariable && isCarat(c)
 		if !(letter || systemVarChar) {
-			if i == 0 || !isDigit(uint16(c)) {
+			if i == 0 || !isDigit(c) {
 				return true
 			}
 		}
@@ -675,16 +778,12 @@ func containEscapableChars(s string, at AtCount) bool {
 	return false
 }
 
-func isKeyword(s string) bool {
-	_, isKeyword := keywords[s]
-	return isKeyword
-}
-
-func formatID(buf *TrackedBuffer, original, lowered string, at AtCount) {
-	if containEscapableChars(original, at) || isKeyword(lowered) {
+func formatID(buf *TrackedBuffer, original string, at AtCount) {
+	_, isKeyword := keywordLookupTable.LookupString(original)
+	if buf.escape || isKeyword || containEscapableChars(original, at) {
 		writeEscapedString(buf, original)
 	} else {
-		buf.Myprintf("%s", original)
+		buf.WriteString(original)
 	}
 }
 
@@ -718,14 +817,54 @@ func (node *Select) AddOrder(order *Order) {
 	node.OrderBy = append(node.OrderBy, order)
 }
 
+// SetOrderBy sets the order by clause
+func (node *Select) SetOrderBy(orderBy OrderBy) {
+	node.OrderBy = orderBy
+}
+
+// GetOrderBy gets the order by clause
+func (node *Select) GetOrderBy() OrderBy {
+	return node.OrderBy
+}
+
 // SetLimit sets the limit clause
 func (node *Select) SetLimit(limit *Limit) {
 	node.Limit = limit
 }
 
 // SetLock sets the lock clause
-func (node *Select) SetLock(lock string) {
+func (node *Select) SetLock(lock Lock) {
 	node.Lock = lock
+}
+
+// SetInto sets the into clause
+func (node *Select) SetInto(into *SelectInto) {
+	node.Into = into
+}
+
+// SetWith sets the with clause to a select statement
+func (node *Select) SetWith(with *With) {
+	node.With = with
+}
+
+// MakeDistinct makes the statement distinct
+func (node *Select) MakeDistinct() {
+	node.Distinct = true
+}
+
+// GetColumnCount return SelectExprs count.
+func (node *Select) GetColumnCount() int {
+	return len(node.SelectExprs)
+}
+
+// SetComments implements the SelectStatement interface
+func (node *Select) SetComments(comments Comments) {
+	node.Comments = comments.Parsed()
+}
+
+// GetComments implements the SelectStatement interface
+func (node *Select) GetParsedComments() *ParsedComments {
+	return node.Comments
 }
 
 // AddWhere adds the boolean expression to the
@@ -733,15 +872,13 @@ func (node *Select) SetLock(lock string) {
 func (node *Select) AddWhere(expr Expr) {
 	if node.Where == nil {
 		node.Where = &Where{
-			Type: WhereStr,
+			Type: WhereClause,
 			Expr: expr,
 		}
 		return
 	}
-	node.Where.Expr = &AndExpr{
-		Left:  node.Where.Expr,
-		Right: expr,
-	}
+	exprs := SplitAndExpression(nil, node.Where.Expr)
+	node.Where.Expr = AndExpressions(append(exprs, expr)...)
 }
 
 // AddHaving adds the boolean expression to the
@@ -749,7 +886,7 @@ func (node *Select) AddWhere(expr Expr) {
 func (node *Select) AddHaving(expr Expr) {
 	if node.Having == nil {
 		node.Having = &Where{
-			Type: HavingStr,
+			Type: HavingClause,
 			Expr: expr,
 		}
 		return
@@ -760,24 +897,46 @@ func (node *Select) AddHaving(expr Expr) {
 	}
 }
 
-// AddOrder adds an order by element
-func (node *ParenSelect) AddOrder(order *Order) {
-	node.Select.AddOrder(order)
+// AddGroupBy adds a grouping expression, unless it's already present
+func (node *Select) AddGroupBy(expr Expr) {
+	for _, gb := range node.GroupBy {
+		if EqualsExpr(gb, expr) {
+			// group by columns are sets - duplicates don't add anything, so we can just skip these
+			return
+		}
+	}
+	node.GroupBy = append(node.GroupBy, expr)
 }
 
-// SetLimit sets the limit clause
-func (node *ParenSelect) SetLimit(limit *Limit) {
-	node.Select.SetLimit(limit)
-}
-
-// SetLock sets the lock clause
-func (node *ParenSelect) SetLock(lock string) {
-	node.Select.SetLock(lock)
+// AddWhere adds the boolean expression to the
+// WHERE clause as an AND condition.
+func (node *Update) AddWhere(expr Expr) {
+	if node.Where == nil {
+		node.Where = &Where{
+			Type: WhereClause,
+			Expr: expr,
+		}
+		return
+	}
+	node.Where.Expr = &AndExpr{
+		Left:  node.Where.Expr,
+		Right: expr,
+	}
 }
 
 // AddOrder adds an order by element
 func (node *Union) AddOrder(order *Order) {
 	node.OrderBy = append(node.OrderBy, order)
+}
+
+// SetOrderBy sets the order by clause
+func (node *Union) SetOrderBy(orderBy OrderBy) {
+	node.OrderBy = orderBy
+}
+
+// GetOrderBy gets the order by clause
+func (node *Union) GetOrderBy() OrderBy {
+	return node.OrderBy
 }
 
 // SetLimit sets the limit clause
@@ -786,22 +945,693 @@ func (node *Union) SetLimit(limit *Limit) {
 }
 
 // SetLock sets the lock clause
-func (node *Union) SetLock(lock string) {
+func (node *Union) SetLock(lock Lock) {
 	node.Lock = lock
 }
 
-//Unionize returns a UNION, either creating one or adding SELECT to an existing one
-func Unionize(lhs, rhs SelectStatement, typ string, by OrderBy, limit *Limit, lock string) *Union {
-	union, isUnion := lhs.(*Union)
-	if isUnion {
-		union.UnionSelects = append(union.UnionSelects, &UnionSelect{Type: typ, Statement: rhs})
-		union.OrderBy = by
-		union.Limit = limit
-		union.Lock = lock
-		return union
+// SetInto sets the into clause
+func (node *Union) SetInto(into *SelectInto) {
+	node.Into = into
+}
+
+// SetWith sets the with clause to a union statement
+func (node *Union) SetWith(with *With) {
+	node.With = with
+}
+
+// MakeDistinct implements the SelectStatement interface
+func (node *Union) MakeDistinct() {
+	node.Distinct = true
+}
+
+// GetColumnCount implements the SelectStatement interface
+func (node *Union) GetColumnCount() int {
+	return node.Left.GetColumnCount()
+}
+
+// SetComments implements the SelectStatement interface
+func (node *Union) SetComments(comments Comments) {
+	node.Left.SetComments(comments)
+}
+
+// GetComments implements the SelectStatement interface
+func (node *Union) GetParsedComments() *ParsedComments {
+	return node.Left.GetParsedComments()
+}
+
+func requiresParen(stmt SelectStatement) bool {
+	switch node := stmt.(type) {
+	case *Union:
+		return len(node.OrderBy) != 0 || node.Lock != 0 || node.Into != nil || node.Limit != nil
+	case *Select:
+		return len(node.OrderBy) != 0 || node.Lock != 0 || node.Into != nil || node.Limit != nil
 	}
 
-	return &Union{FirstStatement: lhs, UnionSelects: []*UnionSelect{{Type: typ, Statement: rhs}}, OrderBy: by, Limit: limit, Lock: lock}
+	return false
+}
+
+func setLockInSelect(stmt SelectStatement, lock Lock) {
+	stmt.SetLock(lock)
+}
+
+// ToString returns the string associated with the DDLAction Enum
+func (action DDLAction) ToString() string {
+	switch action {
+	case CreateDDLAction:
+		return CreateStr
+	case AlterDDLAction:
+		return AlterStr
+	case DropDDLAction:
+		return DropStr
+	case RenameDDLAction:
+		return RenameStr
+	case TruncateDDLAction:
+		return TruncateStr
+	case CreateVindexDDLAction:
+		return CreateVindexStr
+	case DropVindexDDLAction:
+		return DropVindexStr
+	case AddVschemaTableDDLAction:
+		return AddVschemaTableStr
+	case DropVschemaTableDDLAction:
+		return DropVschemaTableStr
+	case AddColVindexDDLAction:
+		return AddColVindexStr
+	case DropColVindexDDLAction:
+		return DropColVindexStr
+	case AddSequenceDDLAction:
+		return AddSequenceStr
+	case AddAutoIncDDLAction:
+		return AddAutoIncStr
+	default:
+		return "Unknown DDL Action"
+	}
+}
+
+// ToString returns the string associated with the Scope enum
+func (scope Scope) ToString() string {
+	switch scope {
+	case SessionScope:
+		return SessionStr
+	case GlobalScope:
+		return GlobalStr
+	case VitessMetadataScope:
+		return VitessMetadataStr
+	case VariableScope:
+		return VariableStr
+	case LocalScope:
+		return LocalStr
+	case ImplicitScope:
+		return ImplicitStr
+	default:
+		return "Unknown Scope"
+	}
+}
+
+// ToString returns the IgnoreStr if ignore is true.
+func (ignore Ignore) ToString() string {
+	if ignore {
+		return IgnoreStr
+	}
+	return ""
+}
+
+// ToString returns the string associated with the type of lock
+func (lock Lock) ToString() string {
+	switch lock {
+	case NoLock:
+		return NoLockStr
+	case ForUpdateLock:
+		return ForUpdateStr
+	case ShareModeLock:
+		return ShareModeStr
+	default:
+		return "Unknown lock"
+	}
+}
+
+// ToString returns the string associated with WhereType
+func (whereType WhereType) ToString() string {
+	switch whereType {
+	case WhereClause:
+		return WhereStr
+	case HavingClause:
+		return HavingStr
+	default:
+		return "Unknown where type"
+	}
+}
+
+// ToString returns the string associated with JoinType
+func (joinType JoinType) ToString() string {
+	switch joinType {
+	case NormalJoinType:
+		return JoinStr
+	case StraightJoinType:
+		return StraightJoinStr
+	case LeftJoinType:
+		return LeftJoinStr
+	case RightJoinType:
+		return RightJoinStr
+	case NaturalJoinType:
+		return NaturalJoinStr
+	case NaturalLeftJoinType:
+		return NaturalLeftJoinStr
+	case NaturalRightJoinType:
+		return NaturalRightJoinStr
+	default:
+		return "Unknown join type"
+	}
+}
+
+// ToString returns the operator as a string
+func (op ComparisonExprOperator) ToString() string {
+	switch op {
+	case EqualOp:
+		return EqualStr
+	case LessThanOp:
+		return LessThanStr
+	case GreaterThanOp:
+		return GreaterThanStr
+	case LessEqualOp:
+		return LessEqualStr
+	case GreaterEqualOp:
+		return GreaterEqualStr
+	case NotEqualOp:
+		return NotEqualStr
+	case NullSafeEqualOp:
+		return NullSafeEqualStr
+	case InOp:
+		return InStr
+	case NotInOp:
+		return NotInStr
+	case LikeOp:
+		return LikeStr
+	case NotLikeOp:
+		return NotLikeStr
+	case RegexpOp:
+		return RegexpStr
+	case NotRegexpOp:
+		return NotRegexpStr
+	default:
+		return "Unknown ComparisonExpOperator"
+	}
+}
+
+// ToString returns the operator as a string
+func (op IsExprOperator) ToString() string {
+	switch op {
+	case IsNullOp:
+		return IsNullStr
+	case IsNotNullOp:
+		return IsNotNullStr
+	case IsTrueOp:
+		return IsTrueStr
+	case IsNotTrueOp:
+		return IsNotTrueStr
+	case IsFalseOp:
+		return IsFalseStr
+	case IsNotFalseOp:
+		return IsNotFalseStr
+	default:
+		return "Unknown IsExprOperator"
+	}
+}
+
+// ToString returns the operator as a string
+func (op BinaryExprOperator) ToString() string {
+	switch op {
+	case BitAndOp:
+		return BitAndStr
+	case BitOrOp:
+		return BitOrStr
+	case BitXorOp:
+		return BitXorStr
+	case PlusOp:
+		return PlusStr
+	case MinusOp:
+		return MinusStr
+	case MultOp:
+		return MultStr
+	case DivOp:
+		return DivStr
+	case IntDivOp:
+		return IntDivStr
+	case ModOp:
+		return ModStr
+	case ShiftLeftOp:
+		return ShiftLeftStr
+	case ShiftRightOp:
+		return ShiftRightStr
+	case JSONExtractOp:
+		return JSONExtractOpStr
+	case JSONUnquoteExtractOp:
+		return JSONUnquoteExtractOpStr
+	default:
+		return "Unknown BinaryExprOperator"
+	}
+}
+
+// ToString returns the partition type as a string
+func (partitionType PartitionByType) ToString() string {
+	switch partitionType {
+	case HashType:
+		return HashTypeStr
+	case KeyType:
+		return KeyTypeStr
+	case ListType:
+		return ListTypeStr
+	case RangeType:
+		return RangeTypeStr
+	default:
+		return "Unknown PartitionByType"
+	}
+}
+
+// ToString returns the partition value range type as a string
+func (t PartitionValueRangeType) ToString() string {
+	switch t {
+	case LessThanType:
+		return LessThanTypeStr
+	case InType:
+		return InTypeStr
+	default:
+		return "Unknown PartitionValueRangeType"
+	}
+}
+
+// ToString returns the operator as a string
+func (op UnaryExprOperator) ToString() string {
+	switch op {
+	case UPlusOp:
+		return UPlusStr
+	case UMinusOp:
+		return UMinusStr
+	case TildaOp:
+		return TildaStr
+	case BangOp:
+		return BangStr
+	case NStringOp:
+		return NStringStr
+	default:
+		return "Unknown UnaryExprOperator"
+	}
+}
+
+// ToString returns the option as a string
+func (option MatchExprOption) ToString() string {
+	switch option {
+	case NoOption:
+		return NoOptionStr
+	case BooleanModeOpt:
+		return BooleanModeStr
+	case NaturalLanguageModeOpt:
+		return NaturalLanguageModeStr
+	case NaturalLanguageModeWithQueryExpansionOpt:
+		return NaturalLanguageModeWithQueryExpansionStr
+	case QueryExpansionOpt:
+		return QueryExpansionStr
+	default:
+		return "Unknown MatchExprOption"
+	}
+}
+
+// ToString returns the direction as a string
+func (dir OrderDirection) ToString() string {
+	switch dir {
+	case AscOrder:
+		return AscScr
+	case DescOrder:
+		return DescScr
+	default:
+		return "Unknown OrderDirection"
+	}
+}
+
+// ToString returns the type as a string
+func (ty IndexHintType) ToString() string {
+	switch ty {
+	case UseOp:
+		return UseStr
+	case IgnoreOp:
+		return IgnoreStr
+	case ForceOp:
+		return ForceStr
+	default:
+		return "Unknown IndexHintType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty DeallocateStmtType) ToString() string {
+	switch ty {
+	case DeallocateType:
+		return DeallocateStr
+	case DropType:
+		return DropStr
+	default:
+		return "Unknown Deallocate Statement Type"
+	}
+}
+
+// ToString returns the type as a string
+func (ty IndexHintForType) ToString() string {
+	switch ty {
+	case NoForType:
+		return ""
+	case JoinForType:
+		return JoinForStr
+	case GroupByForType:
+		return GroupByForStr
+	case OrderByForType:
+		return OrderByForStr
+	default:
+		return "Unknown IndexHintForType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty TrimFuncType) ToString() string {
+	switch ty {
+	case NormalTrimType:
+		return NormalTrimStr
+	case LTrimType:
+		return LTrimStr
+	case RTrimType:
+		return RTrimStr
+	default:
+		return "Unknown TrimFuncType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty TrimType) ToString() string {
+	switch ty {
+	case NoTrimType:
+		return ""
+	case BothTrimType:
+		return BothTrimStr
+	case LeadingTrimType:
+		return LeadingTrimStr
+	case TrailingTrimType:
+		return TrailingTrimStr
+	default:
+		return "Unknown TrimType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty JSONAttributeType) ToString() string {
+	switch ty {
+	case DepthAttributeType:
+		return DepthAttributeStr
+	case ValidAttributeType:
+		return ValidAttributeStr
+	case TypeAttributeType:
+		return TypeAttributeStr
+	case LengthAttributeType:
+		return LengthAttributeStr
+	default:
+		return "Unknown JSONAttributeType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty JSONValueModifierType) ToString() string {
+	switch ty {
+	case JSONArrayAppendType:
+		return JSONArrayAppendStr
+	case JSONArrayInsertType:
+		return JSONArrayInsertStr
+	case JSONInsertType:
+		return JSONInsertStr
+	case JSONReplaceType:
+		return JSONReplaceStr
+	case JSONSetType:
+		return JSONSetStr
+	default:
+		return "Unknown JSONValueModifierType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty JSONValueMergeType) ToString() string {
+	switch ty {
+	case JSONMergeType:
+		return JSONMergeStr
+	case JSONMergePatchType:
+		return JSONMergePatchStr
+	case JSONMergePreserveType:
+		return JSONMergePreserveStr
+	default:
+		return "Unknown JSONValueMergeType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty ExplainType) ToString() string {
+	switch ty {
+	case EmptyType:
+		return EmptyStr
+	case TreeType:
+		return TreeStr
+	case JSONType:
+		return JSONStr
+	case VitessType:
+		return VitessStr
+	case TraditionalType:
+		return TraditionalStr
+	case AnalyzeType:
+		return AnalyzeStr
+	default:
+		return "Unknown ExplainType"
+	}
+}
+
+// ToString returns the type as a string
+func (ty IntervalTypes) ToString() string {
+	switch ty {
+	case IntervalYear:
+		return YearStr
+	case IntervalQuarter:
+		return QuarterStr
+	case IntervalMonth:
+		return MonthStr
+	case IntervalWeek:
+		return WeekStr
+	case IntervalDay:
+		return DayStr
+	case IntervalHour:
+		return HourStr
+	case IntervalMinute:
+		return MinuteStr
+	case IntervalSecond:
+		return SecondStr
+	case IntervalMicrosecond:
+		return MicrosecondStr
+	case IntervalYearMonth:
+		return YearMonthStr
+	case IntervalDayHour:
+		return DayHourStr
+	case IntervalDayMinute:
+		return DayMinuteStr
+	case IntervalDaySecond:
+		return DaySecondStr
+	case IntervalHourMinute:
+		return HourMinuteStr
+	case IntervalHourSecond:
+		return HourSecondStr
+	case IntervalMinuteSecond:
+		return MinuteSecondStr
+	case IntervalDayMicrosecond:
+		return DayMicrosecondStr
+	case IntervalHourMicrosecond:
+		return HourMicrosecondStr
+	case IntervalMinuteMicrosecond:
+		return MinuteMicrosecondStr
+	case IntervalSecondMicrosecond:
+		return SecondMicrosecondStr
+	default:
+		return "Unknown IntervalType"
+	}
+}
+
+// ToString returns the type as a string
+func (sel SelectIntoType) ToString() string {
+	switch sel {
+	case IntoOutfile:
+		return IntoOutfileStr
+	case IntoOutfileS3:
+		return IntoOutfileS3Str
+	case IntoDumpfile:
+		return IntoDumpfileStr
+	default:
+		return "Unknown Select Into Type"
+	}
+}
+
+// ToString returns the type as a string
+func (node CollateAndCharsetType) ToString() string {
+	switch node {
+	case CharacterSetType:
+		return CharacterSetStr
+	case CollateType:
+		return CollateStr
+	default:
+		return "Unknown CollateAndCharsetType Type"
+	}
+}
+
+// ToString returns the type as a string
+func (ty LockType) ToString() string {
+	switch ty {
+	case Read:
+		return ReadStr
+	case ReadLocal:
+		return ReadLocalStr
+	case Write:
+		return WriteStr
+	case LowPriorityWrite:
+		return LowPriorityWriteStr
+	default:
+		return "Unknown LockType"
+	}
+}
+
+// ToString returns ShowCommandType as a string
+func (ty ShowCommandType) ToString() string {
+	switch ty {
+	case Charset:
+		return CharsetStr
+	case Collation:
+		return CollationStr
+	case Column:
+		return ColumnStr
+	case CreateDb:
+		return CreateDbStr
+	case CreateE:
+		return CreateEStr
+	case CreateF:
+		return CreateFStr
+	case CreateProc:
+		return CreateProcStr
+	case CreateTbl:
+		return CreateTblStr
+	case CreateTr:
+		return CreateTrStr
+	case CreateV:
+		return CreateVStr
+	case Database:
+		return DatabaseStr
+	case Engines:
+		return EnginesStr
+	case FunctionC:
+		return FunctionCStr
+	case Function:
+		return FunctionStr
+	case GtidExecGlobal:
+		return GtidExecGlobalStr
+	case Index:
+		return IndexStr
+	case OpenTable:
+		return OpenTableStr
+	case Plugins:
+		return PluginsStr
+	case Privilege:
+		return PrivilegeStr
+	case ProcedureC:
+		return ProcedureCStr
+	case Procedure:
+		return ProcedureStr
+	case StatusGlobal:
+		return StatusGlobalStr
+	case StatusSession:
+		return StatusSessionStr
+	case Table:
+		return TableStr
+	case TableStatus:
+		return TableStatusStr
+	case Trigger:
+		return TriggerStr
+	case VariableGlobal:
+		return VariableGlobalStr
+	case VariableSession:
+		return VariableSessionStr
+	case VGtidExecGlobal:
+		return VGtidExecGlobalStr
+	case VitessMigrations:
+		return VitessMigrationsStr
+	case VitessReplicationStatus:
+		return VitessReplicationStatusStr
+	case VitessShards:
+		return VitessShardsStr
+	case VitessTablets:
+		return VitessTabletsStr
+	case VitessTarget:
+		return VitessTargetStr
+	case VitessVariables:
+		return VitessVariablesStr
+	case VschemaTables:
+		return VschemaTablesStr
+	case VschemaVindexes:
+		return VschemaVindexesStr
+	case Warnings:
+		return WarningsStr
+	case Keyspace:
+		return KeyspaceStr
+	default:
+		return "" +
+			"Unknown ShowCommandType"
+	}
+}
+
+// ToString returns the DropKeyType as a string
+func (key DropKeyType) ToString() string {
+	switch key {
+	case PrimaryKeyType:
+		return PrimaryKeyTypeStr
+	case ForeignKeyType:
+		return ForeignKeyTypeStr
+	case NormalKeyType:
+		return NormalKeyTypeStr
+	default:
+		return "Unknown DropKeyType"
+	}
+}
+
+// ToString returns the LockOptionType as a string
+func (lock LockOptionType) ToString() string {
+	switch lock {
+	case NoneType:
+		return NoneTypeStr
+	case DefaultType:
+		return DefaultTypeStr
+	case SharedType:
+		return SharedTypeStr
+	case ExclusiveType:
+		return ExclusiveTypeStr
+	default:
+		return "Unknown type LockOptionType"
+	}
+}
+
+// CompliantName is used to get the name of the bind variable to use for this column name
+func (node *ColName) CompliantName() string {
+	if !node.Qualifier.IsEmpty() {
+		return node.Qualifier.Name.CompliantName() + "_" + node.Name.CompliantName()
+	}
+	return node.Name.CompliantName()
+}
+
+// isExprAliasForCurrentTimeStamp returns true if the Expr provided is an alias for CURRENT_TIMESTAMP
+func isExprAliasForCurrentTimeStamp(expr Expr) bool {
+	switch node := expr.(type) {
+	case *FuncExpr:
+		return node.Name.EqualString("current_timestamp") || node.Name.EqualString("now") || node.Name.EqualString("localtimestamp") || node.Name.EqualString("localtime")
+	case *CurTimeFuncExpr:
+		return node.Name.EqualString("current_timestamp") || node.Name.EqualString("now") || node.Name.EqualString("localtimestamp") || node.Name.EqualString("localtime")
+	}
+	return false
 }
 
 // AtCount represents the '@' count in ColIdent
@@ -815,3 +1645,195 @@ const (
 	// DoubleAt represnts @@
 	DoubleAt
 )
+
+// encodeSQLString encodes the string as a SQL string.
+func encodeSQLString(val string) string {
+	return sqltypes.EncodeStringSQL(val)
+}
+
+// ToString prints the list of table expressions as a string
+// To be used as an alternate for String for []TableExpr
+func ToString(exprs []TableExpr) string {
+	buf := NewTrackedBuffer(nil)
+	prefix := ""
+	for _, expr := range exprs {
+		buf.astPrintf(nil, "%s%v", prefix, expr)
+		prefix = ", "
+	}
+	return buf.String()
+}
+
+func formatIdentifier(id string) string {
+	buf := NewTrackedBuffer(nil)
+	formatID(buf, id, NoAt)
+	return buf.String()
+}
+
+func formatAddress(address string) string {
+	if len(address) > 0 && address[0] == '\'' {
+		return address
+	}
+	buf := NewTrackedBuffer(nil)
+	formatID(buf, address, NoAt)
+	return buf.String()
+}
+
+// ContainsAggregation returns true if the expression contains aggregation
+func ContainsAggregation(e SQLNode) bool {
+	hasAggregates := false
+	_ = Walk(func(node SQLNode) (kontinue bool, err error) {
+		if IsAggregation(node) {
+			hasAggregates = true
+			return false, nil
+		}
+		return true, nil
+	}, e)
+	return hasAggregates
+}
+
+// IsAggregation returns true if the node is an aggregation expression
+func IsAggregation(node SQLNode) bool {
+	switch node := node.(type) {
+	case *FuncExpr:
+		return node.IsAggregate()
+	case *GroupConcatExpr:
+		return true
+	}
+	return false
+}
+
+// GetFirstSelect gets the first select statement
+func GetFirstSelect(selStmt SelectStatement) *Select {
+	if selStmt == nil {
+		return nil
+	}
+	switch node := selStmt.(type) {
+	case *Select:
+		return node
+	case *Union:
+		return GetFirstSelect(node.Left)
+	}
+	panic("[BUG]: unknown type for SelectStatement")
+}
+
+// GetAllSelects gets all the select statement s
+func GetAllSelects(selStmt SelectStatement) []*Select {
+	switch node := selStmt.(type) {
+	case *Select:
+		return []*Select{node}
+	case *Union:
+		return append(GetAllSelects(node.Left), GetAllSelects(node.Right)...)
+	}
+	panic("[BUG]: unknown type for SelectStatement")
+}
+
+// SetArgName sets argument name.
+func (es *ExtractedSubquery) SetArgName(n string) {
+	es.argName = n
+	es.updateAlternative()
+}
+
+// SetHasValuesArg sets has_values argument.
+func (es *ExtractedSubquery) SetHasValuesArg(n string) {
+	es.hasValuesArg = n
+	es.updateAlternative()
+}
+
+// GetArgName returns argument name.
+func (es *ExtractedSubquery) GetArgName() string {
+	return es.argName
+}
+
+// GetHasValuesArg returns has values argument.
+func (es *ExtractedSubquery) GetHasValuesArg() string {
+	return es.hasValuesArg
+
+}
+
+func (es *ExtractedSubquery) updateAlternative() {
+	switch original := es.Original.(type) {
+	case *ExistsExpr:
+		es.alternative = NewArgument(es.hasValuesArg)
+	case *Subquery:
+		es.alternative = NewArgument(es.argName)
+	case *ComparisonExpr:
+		// other_side = :__sq
+		cmp := &ComparisonExpr{
+			Left:     es.OtherSide,
+			Right:    NewArgument(es.argName),
+			Operator: original.Operator,
+		}
+		var expr Expr = cmp
+		switch original.Operator {
+		case InOp:
+			// :__sq_has_values = 1 and other_side in ::__sq
+			cmp.Right = NewListArg(es.argName)
+			hasValue := &ComparisonExpr{Left: NewArgument(es.hasValuesArg), Right: NewIntLiteral("1"), Operator: EqualOp}
+			expr = AndExpressions(hasValue, cmp)
+		case NotInOp:
+			// :__sq_has_values = 0 or other_side not in ::__sq
+			cmp.Right = NewListArg(es.argName)
+			hasValue := &ComparisonExpr{Left: NewArgument(es.hasValuesArg), Right: NewIntLiteral("0"), Operator: EqualOp}
+			expr = &OrExpr{hasValue, cmp}
+		}
+		es.alternative = expr
+	}
+}
+
+func isExprLiteral(expr Expr) bool {
+	switch expr := expr.(type) {
+	case *Literal:
+		return true
+	case BoolVal:
+		return true
+	case *UnaryExpr:
+		return isExprLiteral(expr.Expr)
+	default:
+		return false
+	}
+}
+
+func defaultRequiresParens(ct *ColumnType) bool {
+	// in 5.7 null value should be without parenthesis, in 8.0 it is allowed either way.
+	// so it is safe to not keep parenthesis around null.
+	if _, isNullVal := ct.Options.Default.(*NullVal); isNullVal {
+		return false
+	}
+
+	switch strings.ToUpper(ct.Type) {
+	case "TINYTEXT", "TEXT", "MEDIUMTEXT", "LONGTEXT", "TINYBLOB", "BLOB", "MEDIUMBLOB",
+		"LONGBLOB", "JSON", "GEOMETRY", "POINT",
+		"LINESTRING", "POLYGON", "MULTIPOINT", "MULTILINESTRING",
+		"MULTIPOLYGON", "GEOMETRYCOLLECTION":
+		return true
+	}
+
+	if isExprLiteral(ct.Options.Default) || isExprAliasForCurrentTimeStamp(ct.Options.Default) {
+		return false
+	}
+
+	return true
+}
+
+// RemoveKeyspaceFromColName removes the Qualifier.Qualifier on all ColNames in the expression tree
+func RemoveKeyspaceFromColName(expr Expr) Expr {
+	return RemoveKeyspace(expr).(Expr) // This hard cast is safe because we do not change the type the input
+}
+
+// RemoveKeyspace removes the Qualifier.Qualifier on all ColNames in the AST
+func RemoveKeyspace(in SQLNode) SQLNode {
+	return Rewrite(in, nil, func(cursor *Cursor) bool {
+		switch col := cursor.Node().(type) {
+		case *ColName:
+			if !col.Qualifier.Qualifier.IsEmpty() {
+				col.Qualifier.Qualifier = NewTableIdent("")
+			}
+		}
+		return true
+	})
+}
+
+func convertStringToInt(integer string) int {
+	val, _ := strconv.Atoi(integer)
+	return val
+}

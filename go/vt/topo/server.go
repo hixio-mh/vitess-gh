@@ -47,7 +47,8 @@ import (
 	"fmt"
 	"sync"
 
-	"golang.org/x/net/context"
+	"context"
+
 	"vitess.io/vitess/go/vt/vterrors"
 
 	"vitess.io/vitess/go/vt/log"
@@ -75,6 +76,7 @@ const (
 	SrvVSchemaFile       = "SrvVSchema"
 	SrvKeyspaceFile      = "SrvKeyspace"
 	RoutingRulesFile     = "RoutingRules"
+	ExternalClustersFile = "ExternalClusters"
 )
 
 // Path for all object types.
@@ -85,6 +87,9 @@ const (
 	ShardsPath       = "shards"
 	TabletsPath      = "tablets"
 	MetadataPath     = "metadata"
+
+	ExternalClusterMySQL  = "mysql"
+	ExternalClusterVitess = "vitess"
 )
 
 // Factory is a factory interface to create Conn objects.
@@ -327,4 +332,66 @@ func (ts *Server) clearCellAliasesCache() {
 	cellsAliases.mu.Lock()
 	defer cellsAliases.mu.Unlock()
 	cellsAliases.cellsToAliases = make(map[string]string)
+}
+
+// OpenExternalVitessClusterServer returns the topo server of the external cluster
+func (ts *Server) OpenExternalVitessClusterServer(ctx context.Context, clusterName string) (*Server, error) {
+	vc, err := ts.GetExternalVitessCluster(ctx, clusterName)
+	if err != nil {
+		return nil, err
+	}
+	if vc == nil {
+		return nil, fmt.Errorf("no vitess cluster found with name %s", clusterName)
+	}
+	var externalTopo *Server
+	externalTopo, err = OpenServer(vc.TopoConfig.TopoType, vc.TopoConfig.Server, vc.TopoConfig.Root)
+	if err != nil {
+		return nil, err
+	}
+	if externalTopo == nil {
+		return nil, fmt.Errorf("unable to open external topo for config %s", clusterName)
+	}
+	return externalTopo, nil
+}
+
+// SetReadOnly is initially ONLY implemented by StatsConn and used in ReadOnlyServer
+func (ts *Server) SetReadOnly(readOnly bool) error {
+	globalCellConn, ok := ts.globalCell.(*StatsConn)
+	if !ok {
+		return fmt.Errorf("invalid global cell connection type, expected StatsConn but found: %T", ts.globalCell)
+	}
+	globalCellConn.SetReadOnly(readOnly)
+
+	for _, conn := range ts.cells {
+		localCellConn, ok := conn.(*StatsConn)
+		if !ok {
+			return fmt.Errorf("invalid local cell connection type, expected StatsConn but found: %T", conn)
+		}
+		localCellConn.SetReadOnly(true)
+	}
+
+	return nil
+}
+
+// IsReadOnly is initially ONLY implemented by StatsConn and used in ReadOnlyServer
+func (ts *Server) IsReadOnly() (bool, error) {
+	globalCellConn, ok := ts.globalCell.(*StatsConn)
+	if !ok {
+		return false, fmt.Errorf("invalid global cell connection type, expected StatsConn but found: %T", ts.globalCell)
+	}
+	if !globalCellConn.IsReadOnly() {
+		return false, nil
+	}
+
+	for _, conn := range ts.cells {
+		localCellConn, ok := conn.(*StatsConn)
+		if !ok {
+			return false, fmt.Errorf("invalid local cell connection type, expected StatsConn but found: %T", conn)
+		}
+		if !localCellConn.IsReadOnly() {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }

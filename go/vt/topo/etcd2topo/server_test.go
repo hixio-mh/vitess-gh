@@ -17,34 +17,28 @@ limitations under the License.
 package etcd2topo
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"testing"
 	"time"
 
-	"vitess.io/vitess/go/vt/log"
-
-	"vitess.io/vitess/go/vt/tlstest"
-
-	"github.com/coreos/etcd/pkg/transport"
-
-	"golang.org/x/net/context"
-
-	"github.com/coreos/etcd/clientv3"
 	"vitess.io/vitess/go/testfiles"
+	"vitess.io/vitess/go/vt/log"
+	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	"vitess.io/vitess/go/vt/tlstest"
 	"vitess.io/vitess/go/vt/topo"
 	"vitess.io/vitess/go/vt/topo/test"
 
-	topodatapb "vitess.io/vitess/go/vt/proto/topodata"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // startEtcd starts an etcd subprocess, and waits for it to be ready.
 func startEtcd(t *testing.T) (*exec.Cmd, string, string) {
 	// Create a temporary directory.
-	dataDir, err := ioutil.TempDir("", "etcd")
+	dataDir, err := os.MkdirTemp("", "etcd")
 	if err != nil {
 		t.Fatalf("cannot create tempdir: %v", err)
 	}
@@ -98,7 +92,7 @@ func startEtcd(t *testing.T) (*exec.Cmd, string, string) {
 // startEtcdWithTLS starts an etcd subprocess with TLS setup, and waits for it to be ready.
 func startEtcdWithTLS(t *testing.T) (string, *tlstest.ClientServerKeyPairs, func()) {
 	// Create a temporary directory.
-	dataDir, err := ioutil.TempDir("", "etcd")
+	dataDir, err := os.MkdirTemp("", "etcd")
 	if err != nil {
 		t.Fatalf("cannot create tempdir: %v", err)
 	}
@@ -135,14 +129,7 @@ func startEtcdWithTLS(t *testing.T) (string, *tlstest.ClientServerKeyPairs, func
 		t.Fatalf("failed to start etcd: %v", err)
 	}
 
-	// Safe now to build up TLS info.
-	tlsInfo := transport.TLSInfo{
-		CertFile:      certs.ClientCert,
-		KeyFile:       certs.ClientKey,
-		TrustedCAFile: certs.ServerCA,
-	}
-
-	tlsConfig, err := tlsInfo.ClientConfig()
+	tlsConfig, err := newTLSConfig(certs.ClientCert, certs.ClientKey, certs.ServerCA)
 	if err != nil {
 		t.Fatalf("failed to get tls.Config: %v", err)
 	}
